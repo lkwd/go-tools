@@ -42,6 +42,8 @@ type Options struct {
 	TabWidth  int  // Tab width (8 if nil *Options provided)
 
 	FormatOnly bool // Disable the insertion and deletion of imports
+
+	IgnoreGrouping bool // Ignore custom import sorting
 }
 
 // Process implements golang.org/x/tools/imports.Process with explicit context in env.
@@ -174,7 +176,7 @@ func initialize(filename string, src []byte, opt *Options) ([]byte, *Options, er
 
 func formatFile(fileSet *token.FileSet, file *ast.File, src []byte, adjust func(orig []byte, src []byte) []byte, opt *Options) ([]byte, error) {
 	mergeImports(opt.Env, fileSet, file)
-	sortImports(opt.Env, fileSet, file)
+	sortImports(opt.Env, fileSet, file, opt.IgnoreGrouping)
 	imps := astutil.Imports(fileSet, file)
 	var spacesBefore []string // import paths we need spaces before
 	for _, impSection := range imps {
@@ -191,7 +193,6 @@ func formatFile(fileSet *token.FileSet, file *ast.File, src []byte, adjust func(
 			}
 			lastGroup = groupNum
 		}
-
 	}
 
 	printerMode := printer.UseSpaces
