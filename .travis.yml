@@ -1,0 +1,35 @@
+sudo:     false
+language: go
+
+cache:
+  directories:
+    - $HOME/.cache/go-build
+    - $HOME/gopath/pkg/mod
+
+go:
+  - master
+  - 1.x
+  - 1.11.x
+  - 1.12.x
+  - 1.13.x
+
+matrix:
+  allow_failures:
+    - go: master
+
+script:
+- |
+  if [[ $TRAVIS_GO_VERSION == 1.13* ]]; then
+    make test-with-coverage-profile
+  else
+    make test
+  fi
+
+after_script:
+- |
+  if [[ $TRAVIS_GO_VERSION == 1.13* && $TRAVIS_TAG ]]; then
+    curl -sL https://git.io/goreleaser | bash
+  fi
+
+notifications:
+  slack: octolab:1eMS7IqOArBipiu31jYVd0cN
