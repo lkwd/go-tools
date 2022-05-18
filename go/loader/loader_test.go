@@ -4,6 +4,7 @@
 
 // No testdata on Android.
 
+//go:build !android
 // +build !android
 
 package loader_test
@@ -831,5 +832,13 @@ func loadIO(t *testing.T) {
 	conf := &loader.Config{ImportPkgs: map[string]bool{"io": false}}
 	if _, err := conf.Load(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCgoCwdIssue46877(t *testing.T) {
+	var conf loader.Config
+	conf.Import("golang.org/x/tools/go/loader/testdata/issue46877")
+	if _, err := conf.Load(); err != nil {
+		t.Errorf("Load failed: %v", err)
 	}
 }

@@ -9,19 +9,25 @@ import (
 
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
+	"golang.org/x/tools/internal/lsp/template"
 )
 
 func (s *Server) definition(ctx context.Context, params *protocol.DefinitionParams) ([]protocol.Location, error) {
-	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, source.Go)
+	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, source.UnknownKind)
 	defer release()
 	if !ok {
 		return nil, err
+	}
+	if snapshot.View().FileKind(fh) == source.Tmpl {
+		return template.Definition(snapshot, fh, params.Position)
 	}
 	ident, err := source.Identifier(ctx, snapshot, fh, params.Position)
 	if err != nil {
 		return nil, err
 	}
-
+	if ident.IsImport() && !snapshot.View().Options().ImportShortcut.ShowDefinition() {
+		return nil, nil
+	}
 	var locations []protocol.Location
 	for _, ref := range ident.Declaration.MappedRange {
 		decRange, err := ref.Range()

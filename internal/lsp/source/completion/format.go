@@ -7,6 +7,8 @@ package completion
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/doc"
 	"go/types"
 	"strings"
 
@@ -17,7 +19,13 @@ import (
 	"golang.org/x/tools/internal/lsp/snippet"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
+	"golang.org/x/tools/internal/typeparams"
 	errors "golang.org/x/xerrors"
+)
+
+var (
+	errNoMatch  = errors.New("not a surrounding match")
+	errLowScore = errors.New("not a high scoring candidate")
 )
 
 // item formats a candidate to a CompletionItem.
@@ -27,13 +35,13 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 	// if the object isn't a valid match against the surrounding, return early.
 	matchScore := c.matcher.Score(cand.name)
 	if matchScore <= 0 {
-		return CompletionItem{}, errors.New("not a surrounding match")
+		return CompletionItem{}, errNoMatch
 	}
 	cand.score *= float64(matchScore)
 
 	// Ignore deep candidates that wont be in the MaxDeepCompletions anyway.
 	if len(cand.path) != 0 && !c.deepState.isHighScore(cand.score) {
-		return CompletionItem{}, errors.New("not a high scoring candidate")
+		return CompletionItem{}, errLowScore
 	}
 
 	// Handle builtin types separately.
@@ -46,20 +54,22 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		detail        = types.TypeString(obj.Type(), c.qf)
 		insert        = label
 		kind          = protocol.TextCompletion
-		snip          *snippet.Builder
+		snip          snippet.Builder
 		protocolEdits []protocol.TextEdit
 	)
 	if obj.Type() == nil {
 		detail = ""
 	}
-
-	// expandFuncCall mutates the completion label, detail, and snippet
-	// to that of an invocation of sig.
-	expandFuncCall := func(sig *types.Signature) {
-		s := source.NewSignature(ctx, c.snapshot, c.pkg, sig, nil, c.qf)
-		snip = c.functionCallSnippet(label, s.Params())
-		detail = "func" + s.Format()
+	if isTypeName(obj) && c.wantTypeParams() {
+		x := cand.obj.(*types.TypeName)
+		if named, ok := x.Type().(*types.Named); ok {
+			tp := typeparams.ForNamed(named)
+			label += source.FormatTypeParams(tp)
+			insert = label // maintain invariant above (label == insert)
+		}
 	}
+
+	snip.WriteText(insert)
 
 	switch obj := obj.(type) {
 	case *types.TypeName:
@@ -74,16 +84,12 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		}
 		if obj.IsField() {
 			kind = protocol.FieldCompletion
-			snip = c.structFieldSnippet(cand, label, detail)
+			c.structFieldSnippet(cand, detail, &snip)
 		} else {
 			kind = protocol.VariableCompletion
 		}
 		if obj.Type() == nil {
 			break
-		}
-
-		if sig, ok := obj.Type().Underlying().(*types.Signature); ok && cand.expandFuncCall {
-			expandFuncCall(sig)
 		}
 	case *types.Func:
 		sig, ok := obj.Type().Underlying().(*types.Signature)
@@ -94,10 +100,6 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		if sig != nil && sig.Recv() != nil {
 			kind = protocol.MethodCompletion
 		}
-
-		if cand.expandFuncCall {
-			expandFuncCall(sig)
-		}
 	case *types.PkgName:
 		kind = protocol.ModuleCompletion
 		detail = fmt.Sprintf("%q", obj.Imported().Path())
@@ -106,10 +108,58 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		detail = "label"
 	}
 
+	var prefix string
+	for _, mod := range cand.mods {
+		switch mod {
+		case reference:
+			prefix = "&" + prefix
+		case dereference:
+			prefix = "*" + prefix
+		case chanRead:
+			prefix = "<-" + prefix
+		}
+	}
+
+	var (
+		suffix   string
+		funcType = obj.Type()
+	)
+Suffixes:
+	for _, mod := range cand.mods {
+		switch mod {
+		case invoke:
+			if sig, ok := funcType.Underlying().(*types.Signature); ok {
+				s := source.NewSignature(ctx, c.snapshot, c.pkg, sig, nil, c.qf)
+				c.functionCallSnippet("", s.TypeParams(), s.Params(), &snip)
+				if sig.Results().Len() == 1 {
+					funcType = sig.Results().At(0).Type()
+				}
+				detail = "func" + s.Format()
+			}
+
+			if !c.opts.snippets {
+				// Without snippets the candidate will not include "()". Don't
+				// add further suffixes since they will be invalid. For
+				// example, with snippets "foo()..." would become "foo..."
+				// without snippets if we added the dotDotDot.
+				break Suffixes
+			}
+		case takeSlice:
+			suffix += "[:]"
+		case takeDotDotDot:
+			suffix += "..."
+		case index:
+			snip.WriteText("[")
+			snip.WritePlaceholder(nil)
+			snip.WriteText("]")
+		}
+	}
+
 	// If this candidate needs an additional import statement,
 	// add the additional text edits needed.
 	if cand.imp != nil {
 		addlEdits, err := c.importEdits(cand.imp)
+
 		if err != nil {
 			return CompletionItem{}, err
 		}
@@ -122,20 +172,6 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 			detail += fmt.Sprintf("(from %q)", cand.imp.importPath)
 		}
 	}
-
-	var prefix, suffix string
-
-	// Prepend "&" or "*" operator as appropriate.
-	if cand.takeAddress {
-		prefix = "&"
-	} else if cand.makePointer {
-		prefix = "*"
-	} else if cand.dereference > 0 {
-		prefix = strings.Repeat("*", cand.dereference)
-	}
-
-	// Include "*" and "&" prefixes in the label.
-	label = prefix + label
 
 	if cand.convertTo != nil {
 		typeName := types.TypeString(cand.convertTo, c.qf)
@@ -151,15 +187,10 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		suffix = ")"
 	}
 
-	// Add variadic "..." if we are filling in a variadic param.
-	if cand.variadic {
-		suffix += "..."
-	}
-
 	if prefix != "" {
 		// If we are in a selector, add an edit to place prefix before selector.
 		if sel := enclosingSelector(c.path, c.pos); sel != nil {
-			edits, err := prependEdit(c.snapshot.FileSet(), c.mapper, sel, prefix)
+			edits, err := c.editText(sel.Pos(), sel.Pos(), prefix)
 			if err != nil {
 				return CompletionItem{}, err
 			}
@@ -167,17 +198,13 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		} else {
 			// If there is no selector, just stick the prefix at the start.
 			insert = prefix + insert
-			if snip != nil {
-				snip.PrependText(prefix)
-			}
+			snip.PrependText(prefix)
 		}
 	}
 
 	if suffix != "" {
 		insert += suffix
-		if snip != nil {
-			snip.WriteText(suffix)
-		}
+		snip.WriteText(suffix)
 	}
 
 	detail = strings.TrimPrefix(detail, "untyped ")
@@ -193,7 +220,7 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		Kind:                kind,
 		Score:               cand.score,
 		Depth:               len(cand.path),
-		snippet:             snip,
+		snippet:             &snip,
 		obj:                 obj,
 	}
 	// If the user doesn't want documentation for completion items.
@@ -209,35 +236,33 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 	}
 	uri := span.URIFromPath(pos.Filename)
 
-	// Find the source file of the candidate, starting from a package
-	// that should have it in its dependencies.
-	searchPkg := c.pkg
-	if cand.imp != nil && cand.imp.pkg != nil {
-		searchPkg = cand.imp.pkg
-	}
-
-	pgf, pkg, err := source.FindPosInPackage(c.snapshot, searchPkg, obj.Pos())
+	// Find the source file of the candidate.
+	pkg, err := source.FindPackageFromPos(ctx, c.snapshot, obj.Pos())
 	if err != nil {
 		return item, nil
 	}
 
-	posToDecl, err := c.snapshot.PosToDecl(ctx, pgf)
+	decl, err := c.snapshot.PosToDecl(ctx, pkg, obj.Pos())
 	if err != nil {
 		return CompletionItem{}, err
 	}
-	decl := posToDecl[obj.Pos()]
-	if decl == nil {
-		return item, nil
-	}
-
-	hover, err := source.HoverInfo(ctx, pkg, obj, decl)
+	hover, err := source.FindHoverContext(ctx, c.snapshot, pkg, obj, decl, nil)
 	if err != nil {
 		event.Error(ctx, "failed to find Hover", err, tag.URI.Of(uri))
 		return item, nil
 	}
-	item.Documentation = hover.Synopsis
 	if c.opts.fullDocumentation {
-		item.Documentation = hover.FullDocumentation
+		item.Documentation = hover.Comment.Text()
+	} else {
+		item.Documentation = doc.Synopsis(hover.Comment.Text())
+	}
+	// The desired pattern is `^// Deprecated`, but the prefix has been removed
+	if strings.HasPrefix(hover.Comment.Text(), "Deprecated") {
+		if c.snapshot.View().Options().CompletionTags {
+			item.Tags = []protocol.CompletionItemTag{protocol.ComplDeprecated}
+		} else if c.snapshot.View().Options().CompletionDeprecated {
+			item.Deprecated = true
+		}
 	}
 
 	return item, nil
@@ -281,7 +306,8 @@ func (c *completer) formatBuiltin(ctx context.Context, cand candidate) (Completi
 			return CompletionItem{}, err
 		}
 		item.Detail = "func" + sig.Format()
-		item.snippet = c.functionCallSnippet(obj.Name(), sig.Params())
+		item.snippet = &snippet.Builder{}
+		c.functionCallSnippet(obj.Name(), sig.TypeParams(), sig.Params(), item.snippet)
 	case *types.TypeName:
 		if types.IsInterface(obj.Type()) {
 			item.Kind = protocol.InterfaceCompletion
@@ -292,4 +318,23 @@ func (c *completer) formatBuiltin(ctx context.Context, cand candidate) (Completi
 		item.Kind = protocol.VariableCompletion
 	}
 	return item, nil
+}
+
+// decide if the type params (if any) should be part of the completion
+// which only possible for types.Named and types.Signature
+// (so far, only in receivers, e.g.; func (s *GENERIC[K, V])..., which is a types.Named)
+func (c *completer) wantTypeParams() bool {
+	// Need to be lexically in a receiver, and a child of an IndexListExpr
+	// (but IndexListExpr only exists with go1.18)
+	start := c.path[0].Pos()
+	for i, nd := range c.path {
+		if fd, ok := nd.(*ast.FuncDecl); ok {
+			if i > 0 && fd.Recv != nil && start < fd.Recv.End() {
+				return true
+			} else {
+				return false
+			}
+		}
+	}
+	return false
 }

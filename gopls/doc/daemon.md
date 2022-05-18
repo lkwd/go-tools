@@ -150,10 +150,10 @@ will use the same shared daemon.
 
 **Q: Why am I not saving as much memory as I expected when using a shared gopls?**
 
-A: As described in [implementation.md](implementation.md), gopls has a concept
-of view/session/cache. Each session and view map onto exactly one editor
-session (because they contain things like edited but unsaved buffers). The
-cache contains things that are independent of any editor session, and can
+A: As described in [implementation.md](design/implementation.md), gopls has a
+concept of view/session/cache. Each session and view map onto exactly one
+editor session (because they contain things like edited but unsaved buffers).
+The cache contains things that are independent of any editor session, and can
 therefore be shared.
 
 When, for example, three editor session are sharing a single gopls process,
@@ -174,8 +174,9 @@ when starting the daemon. As of writing, we expose the following configuration:
 * `-remote.logfile`: the location of the daemon logfile
 * `-remote.debug`: the daemon's debug address
 * `-remote.listen.timeout`: the amount of time the daemon should wait for new
-  connections while there are no current connections, before shutting down. If
-  `0`, listen indefinitely.
+  connections while there are no current connections, before shutting down.
+  Must be set to a valid `time.Duration` (e.g. `30s` or `5m`). If `0`, listen
+  indefinitely. Default: `1m`.
 
 Note that once the daemon is already running, setting these flags will not
 change its configuration. These flags only matter for the forwarder process

@@ -12,8 +12,10 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/span"
@@ -50,7 +52,7 @@ func (r RelativeTo) RelPath(fp string) string {
 }
 
 func writeTxtar(txt string, rel RelativeTo) error {
-	files := unpackTxt(txt)
+	files := UnpackTxt(txt)
 	for name, data := range files {
 		if err := WriteFileData(name, data, rel); err != nil {
 			return errors.Errorf("writing to workdir: %w", err)
@@ -67,11 +69,24 @@ func WriteFileData(path string, content []byte, rel RelativeTo) error {
 	if err := os.MkdirAll(filepath.Dir(fp), 0755); err != nil {
 		return errors.Errorf("creating nested directory: %w", err)
 	}
-	if err := ioutil.WriteFile(fp, []byte(content), 0644); err != nil {
-		return errors.Errorf("writing %q: %w", path, err)
+	backoff := 1 * time.Millisecond
+	for {
+		err := ioutil.WriteFile(fp, []byte(content), 0644)
+		if err != nil {
+			if isWindowsErrLockViolation(err) {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return errors.Errorf("writing %q: %w", path, err)
+		}
+		return nil
 	}
-	return nil
 }
+
+// isWindowsErrLockViolation reports whether err is ERROR_LOCK_VIOLATION
+// on Windows.
+var isWindowsErrLockViolation = func(err error) bool { return false }
 
 // Workdir is a temporary working directory for tests. It exposes file
 // operations in terms of relative paths, and fakes file watching by triggering
@@ -96,8 +111,7 @@ func hashFile(data []byte) string {
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
-func (w *Workdir) writeInitialFiles(txt string) error {
-	files := unpackTxt(txt)
+func (w *Workdir) writeInitialFiles(files map[string][]byte) error {
 	w.files = map[string]string{}
 	for name, data := range files {
 		w.files[name] = hashFile(data)
@@ -139,11 +153,21 @@ func toURI(fp string) protocol.DocumentURI {
 
 // ReadFile reads a text file specified by a workdir-relative path.
 func (w *Workdir) ReadFile(path string) (string, error) {
-	b, err := ioutil.ReadFile(w.AbsPath(path))
-	if err != nil {
-		return "", err
+	backoff := 1 * time.Millisecond
+	for {
+		b, err := ioutil.ReadFile(w.AbsPath(path))
+		if err != nil {
+			if runtime.GOOS == "plan9" && strings.HasSuffix(err.Error(), " exclusive use file already open") {
+				// Plan 9 enforces exclusive access to locked files.
+				// Give the owner time to unlock it and retry.
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return "", err
+		}
+		return string(b), nil
 	}
-	return string(b), nil
 }
 
 func (w *Workdir) RegexpRange(path, re string) (Pos, Pos, error) {
@@ -191,6 +215,9 @@ func (w *Workdir) RemoveFile(ctx context.Context, path string) error {
 	if err := os.RemoveAll(fp); err != nil {
 		return errors.Errorf("removing %q: %w", path, err)
 	}
+	w.fileMu.Lock()
+	defer w.fileMu.Unlock()
+
 	evts := []FileEvent{{
 		Path: path,
 		ProtocolEvent: protocol.FileEvent{
@@ -199,6 +226,7 @@ func (w *Workdir) RemoveFile(ctx context.Context, path string) error {
 		},
 	}}
 	w.sendEvents(ctx, evts)
+	delete(w.files, path)
 	return nil
 }
 
@@ -211,7 +239,7 @@ func (w *Workdir) sendEvents(ctx context.Context, evts []FileEvent) {
 	copy(watchers, w.watchers)
 	w.watcherMu.Unlock()
 	for _, w := range watchers {
-		go w(ctx, evts)
+		w(ctx, evts)
 	}
 }
 

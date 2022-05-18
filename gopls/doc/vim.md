@@ -93,7 +93,7 @@ Use [coc.nvim], with the following `coc-settings.json` configuration:
   "languageserver": {
     "golang": {
       "command": "gopls",
-      "rootPatterns": ["go.mod", ".vim/", ".git/", ".hg/"],
+      "rootPatterns": ["go.work", "go.mod", ".vim/", ".git/", ".hg/"],
       "filetypes": ["go"],
       "initializationOptions": {
         "usePlaceholders": true
@@ -101,6 +101,13 @@ Use [coc.nvim], with the following `coc-settings.json` configuration:
     }
   }
 ```
+
+If you use `go.work` files, you may want to set the
+`workspace.workspaceFolderCheckCwd` option. This will force coc.nvim to search
+parent directories for `go.work` files, even if the current open directory has
+a `go.mod` file. See the
+[coc.nvim documentation](https://github.com/neoclide/coc.nvim/wiki/Using-workspaceFolders)
+for more details.
 
 Other [settings](settings.md) can be added in `initializationOptions` too.
 
@@ -116,8 +123,8 @@ In vim classic only, use the experimental [`govim`], simply follow the [install 
 
 ## <a href="#neovim" id="neovim">Neovim v0.5.0+</a>
 
-To use the new (still experimental) native LSP client in Neovim, make sure you
-[install][nvim-install] the prerelease v0.5.0 version of Neovim (aka “nightly”),
+To use the new native LSP client in Neovim, make sure you
+[install][nvim-install] Neovim v.0.5.0+,
 the `nvim-lspconfig` configuration helper plugin, and check the
 [`gopls` configuration section][nvim-lspconfig] there.
 
@@ -141,8 +148,12 @@ You can add custom configuration using Lua.  Here is an example of enabling the
 ```vim
 lua <<EOF
   lspconfig = require "lspconfig"
+  util = require "lspconfig/util"
+
   lspconfig.gopls.setup {
     cmd = {"gopls", "serve"},
+    filetypes = {"go", "gomod"},
+    root_dir = util.root_pattern("go.work", "go.mod", ".git"),
     settings = {
       gopls = {
         analyses = {
@@ -164,28 +175,23 @@ a helper function in Lua:
 lua <<EOF
   -- …
 
-  function goimports(timeoutms)
-    local context = { source = { organizeImports = true } }
-    vim.validate { context = { context, "t", true } }
-
+  function OrgImports(wait_ms)
     local params = vim.lsp.util.make_range_params()
-    params.context = context
-
-    local method = "textDocument/codeAction"
-    local resp = vim.lsp.buf_request_sync(0, method, params, timeoutms)
-    if resp and resp[1] then
-      local result = resp[1].result
-      if result and result[1] then
-        local edit = result[1].edit
-        vim.lsp.util.apply_workspace_edit(edit)
+    params.context = {only = {"source.organizeImports"}}
+    local result = vim.lsp.buf_request_sync(0, "textDocument/codeAction", params, wait_ms)
+    for _, res in pairs(result or {}) do
+      for _, r in pairs(res.result or {}) do
+        if r.edit then
+          vim.lsp.util.apply_workspace_edit(r.edit)
+        else
+          vim.lsp.buf.execute_command(r.command)
+        end
       end
     end
-
-    vim.lsp.buf.formatting()
   end
 EOF
 
-autocmd BufWritePre *.go lua goimports(1000)
+autocmd BufWritePre *.go lua OrgImports(1000)
 ```
 
 (Taken from the [discussion][nvim-lspconfig-imports] on Neovim issue tracker.)
@@ -215,5 +221,5 @@ autocmd FileType go setlocal omnifunc=v:lua.vim.lsp.omnifunc
 [govim-install]: https://github.com/myitcv/govim/blob/master/README.md#govim---go-development-plugin-for-vim8
 [nvim-docs]: https://neovim.io/doc/user/lsp.html
 [nvim-install]: https://github.com/neovim/neovim/wiki/Installing-Neovim
-[nvim-lspconfig]: https://github.com/neovim/nvim-lspconfig/blob/master/CONFIG.md#gopls
+[nvim-lspconfig]: https://github.com/neovim/nvim-lspconfig/blob/master/doc/server_configurations.md#gopls
 [nvim-lspconfig-imports]: https://github.com/neovim/nvim-lspconfig/issues/115

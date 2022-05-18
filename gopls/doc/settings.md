@@ -63,11 +63,40 @@ the last filter that applies to a path controls whether it is included.
 The path prefix can be empty, so an initial `-` excludes everything.
 
 Examples:
+
 Exclude node_modules: `-node_modules`
+
 Include only project_a: `-` (exclude everything), `+project_a`
+
 Include only project_a, but not node_modules inside it: `-`, `+project_a`, `-project_a/node_modules`
 
+Default: `["-node_modules"]`.
+
+#### **templateExtensions** *[]string*
+
+templateExtensions gives the extensions of file names that are treateed
+as template files. (The extension
+is the part of the file name after the final dot.)
+
 Default: `[]`.
+
+#### **memoryMode** *enum*
+
+**This setting is experimental and may be deleted.**
+
+memoryMode controls the tradeoff `gopls` makes between memory usage and
+correctness.
+
+Values other than `Normal` are untested and may break in surprising ways.
+
+Must be one of:
+
+* `"DegradeClosed"`: In DegradeClosed mode, `gopls` will collect less information about
+packages without open files. As a result, features like Find
+References and Rename will miss results in such packages.
+* `"Normal"`
+
+Default: `"Normal"`.
 
 #### **expandWorkspaceToModule** *bool*
 
@@ -124,6 +153,17 @@ be removed.
 
 Default: `false`.
 
+#### **experimentalUseInvalidMetadata** *bool*
+
+**This setting is experimental and may be deleted.**
+
+experimentalUseInvalidMetadata enables gopls to fall back on outdated
+package metadata to provide editor features if the go command fails to
+load packages for some reason (like an invalid go.mod file). This will
+eventually be the default behavior, and this setting will be removed.
+
+Default: `false`.
+
 ### Formatting
 
 #### **local** *string*
@@ -155,7 +195,7 @@ Example Usage:
 ```json5
 "gopls": {
 ...
-  "codelens": {
+  "codelenses": {
     "generate": false,  // Don't show the `go generate` lens.
     "gc_details": true  // Show a code lens toggling the display of gc's choices.
   }
@@ -207,7 +247,17 @@ Must be one of:
 * `"CaseInsensitive"`
 * `"CaseSensitive"`
 * `"Fuzzy"`
+
 Default: `"Fuzzy"`.
+
+##### **experimentalPostfixCompletions** *bool*
+
+**This setting is experimental and may be deleted.**
+
+experimentalPostfixCompletions enables artifical method snippets
+such as "someSlice.sort!".
+
+Default: `true`.
 
 #### Diagnostic
 
@@ -249,20 +299,17 @@ that should be reported by the gc_details command.
 Can contain any of:
 
 * `"bounds"` controls bounds checking diagnostics.
-
 * `"escape"` controls diagnostics about escape choices.
-
 * `"inline"` controls diagnostics about inlining choices.
-
 * `"nil"` controls nil checks.
 
 Default: `{"bounds":true,"escape":true,"inline":true,"nil":true}`.
 
-##### **experimentalDiagnosticsDelay** *time.Duration*
+##### **diagnosticsDelay** *time.Duration*
 
-**This setting is experimental and may be deleted.**
+**This is an advanced setting and should not be configured by most `gopls` users.**
 
-experimentalDiagnosticsDelay controls the amount of time that gopls waits
+diagnosticsDelay controls the amount of time that gopls waits
 after the most recent file modification before computing deep diagnostics.
 Simple diagnostics (parsing and type-checking) are always run immediately
 on recently modified packages.
@@ -270,6 +317,20 @@ on recently modified packages.
 This option must be set to a valid duration string, for example `"250ms"`.
 
 Default: `"250ms"`.
+
+##### **experimentalWatchedFileDelay** *time.Duration*
+
+**This setting is experimental and may be deleted.**
+
+experimentalWatchedFileDelay controls the amount of time that gopls waits
+for additional workspace/didChangeWatchedFiles notifications to arrive,
+before processing all such notifications in a single batch. This is
+intended for use by LSP clients that don't support their own batching of
+file system notifications.
+
+This option must be set to a valid duration string, for example `"100ms"`.
+
+Default: `"0s"`.
 
 #### Documentation
 
@@ -287,8 +348,8 @@ Must be one of:
 This format separates the signature from the documentation, so that the client
 can do more manipulation of these fields.\
 This should only be used by clients that support this behavior.
-
 * `"SynopsisDocumentation"`
+
 Default: `"FullDocumentation"`.
 
 ##### **linkTarget** *string*
@@ -321,6 +382,7 @@ Must be one of:
 * `"Both"`
 * `"Definition"`
 * `"Link"`
+
 Default: `"Both"`.
 
 ##### **symbolMatcher** *enum*
@@ -333,8 +395,10 @@ Must be one of:
 
 * `"CaseInsensitive"`
 * `"CaseSensitive"`
+* `"FastFuzzy"`
 * `"Fuzzy"`
-Default: `"Fuzzy"`.
+
+Default: `"FastFuzzy"`.
 
 ##### **symbolStyle** *enum*
 
@@ -347,7 +411,7 @@ Example Usage:
 ```json5
 "gopls": {
 ...
-  "symbolStyle": "dynamic",
+  "symbolStyle": "Dynamic",
 ...
 }
 ```
@@ -358,10 +422,8 @@ Must be one of:
 match for the given symbol query. Here a "qualifier" is any "/" or "."
 delimited suffix of the fully qualified symbol. i.e. "to/pkg.Foo.Field" or
 just "Foo.Field".
-
 * `"Full"` is fully qualified symbols, i.e.
 "path/to/pkg.Foo.Field".
-
 * `"Package"` is package qualified symbols i.e.
 "pkg.Foo.Field".
 
@@ -384,46 +446,39 @@ and disabled using the `codelenses` setting, documented above. Their names and
 features are subject to change.
 
 <!-- BEGIN Lenses: DO NOT MANUALLY EDIT THIS SECTION -->
-### **Run go generate**
-
-Identifier: `generate`
-
-generate runs `go generate` for a given directory.
-
-### **Regenerate cgo**
-
-Identifier: `regenerate_cgo`
-
-regenerate_cgo regenerates cgo definitions.
-
-### **Run test(s)**
-
-Identifier: `test`
-
-test runs `go test` for a specific test function.
-
-### **Run go mod tidy**
-
-Identifier: `tidy`
-
-tidy runs `go mod tidy` for a module.
-
-### **Upgrade dependency**
-
-Identifier: `upgrade_dependency`
-
-upgrade_dependency upgrades a dependency.
-
-### **Run go mod vendor**
-
-Identifier: `vendor`
-
-vendor runs `go mod vendor` for a module.
-
 ### **Toggle gc_details**
 
 Identifier: `gc_details`
 
-gc_details controls calculation of gc annotations.
+Toggle the calculation of gc annotations.
+### **Run go generate**
 
+Identifier: `generate`
+
+Runs `go generate` for a given directory.
+### **Regenerate cgo**
+
+Identifier: `regenerate_cgo`
+
+Regenerates cgo definitions.
+### **Run test(s) (legacy)**
+
+Identifier: `test`
+
+Runs `go test` for a specific set of test or benchmark functions.
+### **Run go mod tidy**
+
+Identifier: `tidy`
+
+Runs `go mod tidy` for a module.
+### **Upgrade a dependency**
+
+Identifier: `upgrade_dependency`
+
+Upgrades a dependency in the go.mod file for a module.
+### **Run go mod vendor**
+
+Identifier: `vendor`
+
+Runs `go mod vendor` for a module.
 <!-- END Lenses: DO NOT MANUALLY EDIT THIS SECTION -->

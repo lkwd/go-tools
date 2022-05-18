@@ -4,8 +4,8 @@
 
 // No testdata on Android.
 
-// +build !android
-// +build go1.11
+//go:build !android && go1.11
+// +build !android,go1.11
 
 package main
 
@@ -34,6 +34,10 @@ func init() {
 }
 
 func TestCallgraph(t *testing.T) {
+	if b := os.Getenv("GO_BUILDER_NAME"); b == "windows-arm64-10" {
+		t.Skipf("skipping due to suspected file corruption bug on %s builder (https://go.dev/issue/50706)", b)
+	}
+
 	testenv.NeedsTool(t, "go")
 
 	gopath, err := filepath.Abs("testdata")

@@ -1,8 +1,8 @@
-Flag `-ungroup` added possibility to reset custom import sorting ([diff][]).
+## Motivation
 
-## Example
+`goimports` has inconsistent behavior that affects a final diff. For example
 
-Input:
+- input
 
 ```go
 import (
@@ -16,7 +16,7 @@ import (
 )
 ```
 
-Simple `goimports` output:
+- output
 
 ```go
 import (
@@ -31,7 +31,7 @@ import (
 )
 ```
 
-With `-ungroup` flag output:
+The proper result for me is
 
 ```go
 import (
@@ -45,26 +45,19 @@ import (
 )
 ```
 
-## How to install
+The flag `-ungroup` added possibility to reset custom import sorting.
 
-### Homebrew
+## Related issues
 
-```bash
-$ brew install kamilsk/tap/goimports
-```
+- https://github.com/golang/tools/pull/68
+- https://github.com/golang/tools/pull/308
+- https://github.com/golang/tools/compare/master...kamilsk:extended
 
-### Binary
+## What's changed
 
-```bash
-$ curl -sSfL https://bit.ly/install-goimports | sh -s -- -b $(go env GOPATH)/bin
-```
-
-## How to run
-
-As usual, just add `-ungroup` flag.
-
-Happy hacking!
+- The `goimports` supports `-ungroup` flag to reset custom import sorting.
+- The tool is available by `brew install kamilsk/tap/goimports`.
+- The installation is also possible by
+  `curl -sSfL https://raw.githubusercontent.com/kamilsk/go-tools/extended/bin/install | sh -s -- -b /usr/local/bin`.
 
 <!-- references -->
-
-[diff]: https://github.com/golang/tools/compare/master...kamilsk:extended

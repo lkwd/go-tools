@@ -26,7 +26,7 @@ func TestModfileRemainsUnchanged(t *testing.T) {
 	testenv.NeedsGo1Point(t, 14)
 
 	ctx := tests.Context(t)
-	cache := cache.New(ctx, nil)
+	cache := cache.New(nil)
 	session := cache.NewSession(ctx)
 	options := source.DefaultOptions().Clone()
 	tests.DefaultOptions(options)
@@ -45,7 +45,7 @@ func TestModfileRemainsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, release, err := session.NewView(ctx, "diagnostics_test", span.URIFromPath(folder), "", options)
+	_, _, release, err := session.NewView(ctx, "diagnostics_test", span.URIFromPath(folder), options)
 	release()
 	if err != nil {
 		t.Fatal(err)

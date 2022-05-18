@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"go/ast"
+	"go/scanner"
 	"go/token"
 	"go/types"
 	"io"
@@ -17,8 +18,10 @@ import (
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/imports"
+	"golang.org/x/tools/internal/lsp/progress"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
@@ -68,6 +71,9 @@ type Snapshot interface {
 	// workspace.
 	IgnoredFile(uri span.URI) bool
 
+	// Templates returns the .tmpl files
+	Templates() map[span.URI]VersionedFileHandle
+
 	// ParseGo returns the parsed AST for the file.
 	// If the file is not available, returns nil and an error.
 	ParseGo(ctx context.Context, fh FileHandle, mode ParseMode) (*ParsedGoFile, error)
@@ -76,15 +82,19 @@ type Snapshot interface {
 	// to quickly find corresponding *ast.Field node given a *types.Var.
 	// We must refer to the AST to render type aliases properly when
 	// formatting signatures and other types.
-	PosToField(ctx context.Context, pgf *ParsedGoFile) (map[token.Pos]*ast.Field, error)
+	PosToField(ctx context.Context, pkg Package, pos token.Pos) (*ast.Field, error)
 
 	// PosToDecl maps certain objects' positions to their surrounding
 	// ast.Decl. This mapping is used when building the documentation
 	// string for the objects.
-	PosToDecl(ctx context.Context, pgf *ParsedGoFile) (map[token.Pos]ast.Decl, error)
+	PosToDecl(ctx context.Context, pkg Package, pos token.Pos) (ast.Decl, error)
+
+	// DiagnosePackage returns basic diagnostics, including list, parse, and type errors
+	// for pkg, grouped by file.
+	DiagnosePackage(ctx context.Context, pkg Package) (map[span.URI][]*Diagnostic, error)
 
 	// Analyze runs the analyses for the given package at this snapshot.
-	Analyze(ctx context.Context, pkgID string, analyzers ...*analysis.Analyzer) ([]*Error, error)
+	Analyze(ctx context.Context, pkgID string, analyzers []*Analyzer) ([]*Diagnostic, error)
 
 	// RunGoCommandPiped runs the given `go` command, writing its output
 	// to stdout and stderr. Verb, Args, and WorkingDir must be specified.
@@ -93,6 +103,10 @@ type Snapshot interface {
 	// RunGoCommandDirect runs the given `go` command. Verb, Args, and
 	// WorkingDir must be specified.
 	RunGoCommandDirect(ctx context.Context, mode InvocationFlags, inv *gocommand.Invocation) (*bytes.Buffer, error)
+
+	// RunGoCommands runs a series of `go` commands that updates the go.mod
+	// and go.sum file for wd, and returns their updated contents.
+	RunGoCommands(ctx context.Context, allowNetwork bool, wd string, run func(invoke func(...string) (*bytes.Buffer, error)) error) (bool, []byte, []byte, error)
 
 	// RunProcessEnvFunc runs fn with the process env for this snapshot's view.
 	// Note: the process env contains cached module and filesystem state.
@@ -109,10 +123,6 @@ type Snapshot interface {
 	// the given go.mod file.
 	ModWhy(ctx context.Context, fh FileHandle) (map[string]string, error)
 
-	// ModUpgrade returns the possible updates for the module specified by the
-	// given go.mod file.
-	ModUpgrade(ctx context.Context, fh FileHandle) (map[string]string, error)
-
 	// ModTidy returns the results of `go mod tidy` for the module specified by
 	// the given go.mod file.
 	ModTidy(ctx context.Context, pm *ParsedModule) (*TidiedModule, error)
@@ -120,12 +130,21 @@ type Snapshot interface {
 	// GoModForFile returns the URI of the go.mod file for the given URI.
 	GoModForFile(uri span.URI) span.URI
 
-	// BuiltinPackage returns information about the special builtin package.
-	BuiltinPackage(ctx context.Context) (*BuiltinPackage, error)
+	// WorkFile, if non-empty, is the go.work file for the workspace.
+	WorkFile() span.URI
+
+	// ParseWork is used to parse go.work files.
+	ParseWork(ctx context.Context, fh FileHandle) (*ParsedWorkFile, error)
+
+	// BuiltinFile returns information about the special builtin package.
+	BuiltinFile(ctx context.Context) (*ParsedGoFile, error)
+
+	// IsBuiltin reports whether uri is part of the builtin package.
+	IsBuiltin(ctx context.Context, uri span.URI) bool
 
 	// PackagesForFile returns the packages that this file belongs to, checked
 	// in mode.
-	PackagesForFile(ctx context.Context, uri span.URI, mode TypecheckMode) ([]Package, error)
+	PackagesForFile(ctx context.Context, uri span.URI, mode TypecheckMode, includeTestVariants bool) ([]Package, error)
 
 	// PackageForFile returns a single package that this file belongs to,
 	// checked in mode and filtered by the package policy.
@@ -144,11 +163,24 @@ type Snapshot interface {
 	// in TypecheckWorkspace mode.
 	KnownPackages(ctx context.Context) ([]Package, error)
 
-	// WorkspacePackages returns the snapshot's top-level packages.
-	WorkspacePackages(ctx context.Context) ([]Package, error)
+	// ActivePackages returns the packages considered 'active' in the workspace.
+	//
+	// In normal memory mode, this is all workspace packages. In degraded memory
+	// mode, this is just the reverse transitive closure of open packages.
+	ActivePackages(ctx context.Context) ([]Package, error)
+
+	// Symbols returns all symbols in the snapshot.
+	Symbols(ctx context.Context) (map[span.URI][]Symbol, error)
+
+	// Metadata returns package metadata associated with the given file URI.
+	MetadataForFile(ctx context.Context, uri span.URI) ([]Metadata, error)
 
 	// GetCriticalError returns any critical errors in the workspace.
 	GetCriticalError(ctx context.Context) *CriticalError
+
+	// BuildGoplsMod generates a go.mod file for all modules in the workspace.
+	// It bypasses any existing gopls.mod.
+	BuildGoplsMod(ctx context.Context) (*modfile.File, error)
 }
 
 // PackageFilter sets how a package is filtered out from a set of packages
@@ -176,9 +208,6 @@ const (
 	// Normal is appropriate for commands that might be run by a user and don't
 	// deliberately modify go.mod files, e.g. `go test`.
 	Normal InvocationFlags = iota
-	// UpdateUserModFile is for commands that intend to update the user's real
-	// go.mod file, e.g. `go mod tidy` in response to a user's request to tidy.
-	UpdateUserModFile
 	// WriteTemporaryModFile is for commands that need information from a
 	// modified version of the user's go.mod file, e.g. `go mod tidy` used to
 	// generate diagnostics.
@@ -189,7 +218,7 @@ const (
 
 	// AllowNetwork is a flag bit that indicates the invocation should be
 	// allowed to access the network.
-	AllowNetwork = 1 << 10
+	AllowNetwork InvocationFlags = 1 << 10
 )
 
 func (m InvocationFlags) Mode() InvocationFlags {
@@ -231,6 +260,15 @@ type View interface {
 	// IsGoPrivatePath reports whether target is a private import path, as identified
 	// by the GOPRIVATE environment variable.
 	IsGoPrivatePath(path string) bool
+
+	// ModuleUpgrades returns known module upgrades.
+	ModuleUpgrades() map[string]string
+
+	// RegisterModuleUpgrades registers that upgrades exist for the given modules.
+	RegisterModuleUpgrades(upgrades map[string]string)
+
+	// FileKind returns the type of a file
+	FileKind(FileHandle) FileKind
 }
 
 // A FileSource maps uris to FileHandles. This abstraction exists both for
@@ -239,11 +277,6 @@ type View interface {
 type FileSource interface {
 	// GetFile returns the FileHandle for a given URI.
 	GetFile(ctx context.Context, uri span.URI) (FileHandle, error)
-}
-
-type BuiltinPackage struct {
-	Package    *ast.Package
-	ParsedFile *ParsedGoFile
 }
 
 // A ParsedGoFile contains the results of parsing a Go file.
@@ -256,7 +289,7 @@ type ParsedGoFile struct {
 	// actual content of the file if we have fixed the AST.
 	Src      []byte
 	Mapper   *protocol.ColumnMapper
-	ParseErr error
+	ParseErr scanner.ErrorList
 }
 
 // A ParsedModule contains the results of parsing a go.mod file.
@@ -264,15 +297,35 @@ type ParsedModule struct {
 	URI         span.URI
 	File        *modfile.File
 	Mapper      *protocol.ColumnMapper
-	ParseErrors []*Error
+	ParseErrors []*Diagnostic
+}
+
+// A ParsedWorkFile contains the results of parsing a go.work file.
+type ParsedWorkFile struct {
+	URI         span.URI
+	File        *modfile.WorkFile
+	Mapper      *protocol.ColumnMapper
+	ParseErrors []*Diagnostic
 }
 
 // A TidiedModule contains the results of running `go mod tidy` on a module.
 type TidiedModule struct {
 	// Diagnostics representing changes made by `go mod tidy`.
-	Errors []*Error
+	Diagnostics []*Diagnostic
 	// The bytes of the go.mod file after it was tidied.
 	TidiedContent []byte
+}
+
+// Metadata represents package metadata retrieved from go/packages.
+type Metadata interface {
+	// PackageName is the package name.
+	PackageName() string
+
+	// PackagePath is the package path.
+	PackagePath() string
+
+	// ModuleInfo returns the go/packages module information for the given package.
+	ModuleInfo() *packages.Module
 }
 
 // Session represents a single connection from a client.
@@ -280,8 +333,13 @@ type TidiedModule struct {
 // of the client.
 // A session may have many active views at any given time.
 type Session interface {
-	// NewView creates a new View, returning it and its first snapshot.
-	NewView(ctx context.Context, name string, folder, tempWorkspaceDir span.URI, options *Options) (View, Snapshot, func(), error)
+	// ID returns the unique identifier for this session on this server.
+	ID() string
+	// NewView creates a new View, returning it and its first snapshot. If a
+	// non-empty tempWorkspace directory is provided, the View will record a copy
+	// of its gopls workspace module in that directory, so that client tooling
+	// can execute in the same main module.
+	NewView(ctx context.Context, name string, folder span.URI, options *Options) (View, Snapshot, func(), error)
 
 	// Cache returns the cache that created this session, for debugging only.
 	Cache() interface{}
@@ -324,10 +382,16 @@ type Session interface {
 	// known by the view. For views within a module, this is the module root,
 	// any directory in the module root, and any replace targets.
 	FileWatchingGlobPatterns(ctx context.Context) map[string]struct{}
+
+	// SetProgressTracker sets the progress tracker for the session.
+	SetProgressTracker(tracker *progress.Tracker)
 }
+
+var ErrViewExists = errors.New("view already exists for session")
 
 // Overlay is the type for a file held in memory on a session.
 type Overlay interface {
+	Kind() FileKind
 	VersionedFileHandle
 }
 
@@ -342,7 +406,7 @@ type FileModification struct {
 
 	// Version will be -1 and Text will be nil when they are not supplied,
 	// specifically on textDocument/didClose and for on-disk changes.
-	Version float64
+	Version int32
 	Text    []byte
 
 	// LanguageID is only sent from the language client on textDocument/didOpen.
@@ -398,10 +462,9 @@ const (
 	// This is the mode used when attempting to examine the package graph structure.
 	ParseHeader ParseMode = iota
 
-	// ParseExported specifies that the public symbols are needed, but things like
-	// private symbols and function bodies are not.
-	// This mode is used for things where a package is being consumed only as a
-	// dependency.
+	// ParseExported specifies that the package is used only as a dependency,
+	// and only its exported declarations are needed. More may be included if
+	// necessary to avoid type errors.
 	ParseExported
 
 	// ParseFull specifies the full AST is needed.
@@ -429,7 +492,7 @@ const (
 
 type VersionedFileHandle interface {
 	FileHandle
-	Version() float64
+	Version() int32
 	Session() string
 
 	// LSPIdentity returns the version identity of a file.
@@ -444,13 +507,12 @@ type VersionedFileIdentity struct {
 
 	// Version is the version of the file, as specified by the client. It should
 	// only be set in combination with SessionID.
-	Version float64
+	Version int32
 }
 
 // FileHandle represents a handle to a specific version of a single file.
 type FileHandle interface {
 	URI() span.URI
-	Kind() FileKind
 
 	// FileIdentity returns a FileIdentity for the file, even if there was an
 	// error reading it.
@@ -468,17 +530,14 @@ type FileIdentity struct {
 
 	// Identifier represents a unique identifier for the file's content.
 	Hash string
-
-	// Kind is the file's kind.
-	Kind FileKind
 }
 
 func (id FileIdentity) String() string {
-	return fmt.Sprintf("%s%s%s", id.URI, id.Hash, id.Kind)
+	return fmt.Sprintf("%s%s", id.URI, id.Hash)
 }
 
 // FileKind describes the kind of the file in question.
-// It can be one of Go, mod, or sum.
+// It can be one of Go,mod, Sum, or Tmpl.
 type FileKind int
 
 const (
@@ -491,6 +550,10 @@ const (
 	Mod
 	// Sum is a go.sum file.
 	Sum
+	// Tmpl is a template file.
+	Tmpl
+	// Work is a go.work file.
+	Work
 )
 
 // Analyzer represents a go/analysis analyzer with some boolean properties
@@ -503,20 +566,19 @@ type Analyzer struct {
 	// the value of the Staticcheck setting overrides this field.
 	Enabled bool
 
-	// Command is the name of the command used to invoke the suggested fixes
-	// for the analyzer. It is non-nil if we expect this analyzer to provide
-	// its fix separately from its diagnostics. That is, we should apply the
-	// analyzer's suggested fixes through a Command, not a TextEdit.
-	Command *Command
+	// Fix is the name of the suggested fix name used to invoke the suggested
+	// fixes for the analyzer. It is non-empty if we expect this analyzer to
+	// provide its fix separately from its diagnostics. That is, we should apply
+	// the analyzer's suggested fixes through a Command, not a TextEdit.
+	Fix string
 
-	// If this is true, then we can apply the suggested fixes
-	// as part of a source.FixAll codeaction.
-	HighConfidence bool
+	// ActionKind is the kind of code action this analyzer produces. If
+	// unspecified the type defaults to quickfix.
+	ActionKind []protocol.CodeActionKind
 
-	// FixesError is only set for type-error analyzers.
-	// It reports true if the message provided indicates an error that could be
-	// fixed by the analyzer.
-	FixesError func(msg string) bool
+	// Severity is the severity set for diagnostics reported by this
+	// analyzer. If left unset it defaults to Warning.
+	Severity protocol.DiagnosticSeverity
 }
 
 func (a Analyzer) IsEnabled(view View) bool {
@@ -541,7 +603,6 @@ type Package interface {
 	CompiledGoFiles() []*ParsedGoFile
 	File(uri span.URI) (*ParsedGoFile, error)
 	GetSyntax() []*ast.File
-	GetErrors() []*Error
 	GetTypes() *types.Package
 	GetTypesInfo() *types.Info
 	GetTypesSizes() types.Sizes
@@ -551,58 +612,58 @@ type Package interface {
 	MissingDependencies() []string
 	Imports() []Package
 	Version() *module.Version
+	HasListOrParseErrors() bool
+	HasTypeErrors() bool
+	ParseMode() ParseMode
 }
 
 type CriticalError struct {
+	// MainError is the primary error. Must be non-nil.
 	MainError error
-	ErrorList []*Error
+	// DiagList contains any supplemental (structured) diagnostics.
+	DiagList []*Diagnostic
 }
 
-func (err *CriticalError) Error() string {
-	if err.MainError == nil {
-		return ""
-	}
-	return err.MainError.Error()
-}
-
-// An Error corresponds to an LSP Diagnostic.
+// An Diagnostic corresponds to an LSP Diagnostic.
 // https://microsoft.github.io/language-server-protocol/specification#diagnostic
-type Error struct {
+type Diagnostic struct {
 	URI      span.URI
 	Range    protocol.Range
-	Kind     ErrorKind
-	Message  string
-	Category string // only used by analysis errors so far
-
-	Related []RelatedInformation
-
+	Severity protocol.DiagnosticSeverity
 	Code     string
 	CodeHref string
 
-	// SuggestedFixes is used to generate quick fixes for a CodeAction request.
-	// It isn't part of the Diagnostic type.
+	// Source is a human-readable description of the source of the error.
+	// Diagnostics generated by an analysis.Analyzer set it to Analyzer.Name.
+	Source DiagnosticSource
+
+	Message string
+
+	Tags    []protocol.DiagnosticTag
+	Related []RelatedInformation
+
+	// Fields below are used internally to generate quick fixes. They aren't
+	// part of the LSP spec and don't leave the server.
 	SuggestedFixes []SuggestedFix
+	Analyzer       *Analyzer
 }
 
-// GoModTidy is the source for a diagnostic computed by running `go mod tidy`.
-const GoModTidy = "go mod tidy"
-
-type ErrorKind int
+type DiagnosticSource string
 
 const (
-	UnknownError = ErrorKind(iota)
-	ListError
-	ParseError
-	TypeError
-	ModTidyError
-	Analysis
+	UnknownError             DiagnosticSource = "<Unknown source>"
+	ListError                DiagnosticSource = "go list"
+	ParseError               DiagnosticSource = "syntax"
+	TypeError                DiagnosticSource = "compiler"
+	ModTidyError             DiagnosticSource = "go mod tidy"
+	OptimizationDetailsError DiagnosticSource = "optimizer details"
+	UpgradeNotification      DiagnosticSource = "upgrade available"
+	TemplateError            DiagnosticSource = "template"
+	WorkFileError            DiagnosticSource = "go.work file"
 )
 
-func (e *Error) Error() string {
-	if e.URI == "" {
-		return e.Message
-	}
-	return fmt.Sprintf("%s:%s: %s", e.URI, e.Range, e.Message)
+func AnalyzerErrorKind(name string) DiagnosticSource {
+	return DiagnosticSource(name)
 }
 
 var (
@@ -614,12 +675,22 @@ var (
 // sure not to show this version to end users in error messages, to avoid
 // confusion.
 // The major version is not included, as that depends on the module path.
-const workspaceModuleVersion = ".0.0-goplsworkspace"
+//
+// If workspace module A is dependent on workspace module B, we need our
+// nonexistant version to be greater than the version A mentions.
+// Otherwise, the go command will try to update to that version. Use a very
+// high minor version to make that more likely.
+const workspaceModuleVersion = ".9999999.0-goplsworkspace"
 
 func IsWorkspaceModuleVersion(version string) bool {
 	return strings.HasSuffix(version, workspaceModuleVersion)
 }
 
 func WorkspaceModuleVersion(majorVersion string) string {
+	// Use the highest compatible major version to avoid unwanted upgrades.
+	// See the comment on workspaceModuleVersion.
+	if majorVersion == "v0" {
+		majorVersion = "v1"
+	}
 	return majorVersion + workspaceModuleVersion
 }

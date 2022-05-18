@@ -1,7 +1,7 @@
 # Documentation for contributors
 
 This documentation augments the general documentation for contributing to the
-x/tools repository, described at the [repository root](../CONTRIBUTING.md).
+x/tools repository, described at the [repository root](../../CONTRIBUTING.md).
 
 Contributions are welcome, but since development is so active, we request that
 you file an issue and claim it before starting to work on something. Otherwise,
@@ -96,13 +96,21 @@ Furthermore, an additional "gopls-CI" pass will be run by _Kokoro_, which is a
 Jenkins-like Google infrastructure for running Dockerized tests. This allows us
 to run gopls tests in various environments that would be difficult to add to
 the TryBots. Notably, Kokoro runs tests on
-[older Go versions](user.md#supported-go-versions) that are no longer supported
-by the TryBots.
+[older Go versions](../README.md#supported-go-versions) that are no longer supported
+by the TryBots. Per that that policy, support for these older Go versions is
+best-effort, and test failures may be skipped rather than fixed.
+
+Kokoro runs are triggered by the `Run-TryBot=1` label, just like TryBots, but
+unlike TryBots they do not automatically re-run if the "gopls-CI" result is
+removed in Gerrit. To force a re-run of the Kokoro CI on a CL containing the
+`Run-TryBot=1` label, you can reply in Gerrit with the comment "kokoro rerun".
 
 ## Debugging
 
-The easiest way to debug your change is to run can run a single `gopls` test
-with a debugger.
+The easiest way to debug your change is to run a single `gopls` test with a
+debugger.
+
+See also [Troubleshooting](troubleshooting.md#troubleshooting).
 
 <!--TODO(rstambler): Add more details about the debug server and viewing
 telemetry.-->

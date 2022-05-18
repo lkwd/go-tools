@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"go/types"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -28,33 +27,26 @@ import (
 	errors "golang.org/x/xerrors"
 )
 
-// metadata holds package metadata extracted from a call to packages.Load.
-type metadata struct {
-	id              packageID
-	pkgPath         packagePath
-	name            packageName
-	goFiles         []span.URI
-	compiledGoFiles []span.URI
-	forTest         packagePath
-	typesSizes      types.Sizes
-	errors          []packages.Error
-	deps            []packageID
-	missingDeps     map[packagePath]struct{}
-	module          *packages.Module
-
-	// config is the *packages.Config associated with the loaded package.
-	config *packages.Config
-}
-
 // load calls packages.Load for the given scopes, updating package metadata,
 // import graph, and mapped files with the result.
-func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interface{}) error {
+func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interface{}) (err error) {
 	var query []string
 	var containsDir bool // for logging
 	for _, scope := range scopes {
+		if !s.shouldLoad(scope) {
+			continue
+		}
+		// Unless the context was canceled, set "shouldLoad" to false for all
+		// of the metadata we attempted to load.
+		defer func() {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			s.clearShouldLoad(scope)
+		}()
 		switch scope := scope.(type) {
-		case packagePath:
-			if isCommandLineArguments(string(scope)) {
+		case PackagePath:
+			if source.IsCommandLineArguments(string(scope)) {
 				panic("attempted to load command-line-arguments")
 			}
 			// The only time we pass package paths is when we're doing a
@@ -65,12 +57,17 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 			uri := span.URI(scope)
 			// Don't try to load a file that doesn't exist.
 			fh := s.FindFile(uri)
-			if fh == nil || fh.Kind() != source.Go {
+			if fh == nil || s.View().FileKind(fh) != source.Go {
 				continue
 			}
 			query = append(query, fmt.Sprintf("file=%s", uri.Filename()))
 		case moduleLoadScope:
-			query = append(query, fmt.Sprintf("%s/...", scope))
+			switch scope {
+			case "std", "cmd":
+				query = append(query, string(scope))
+			default:
+				query = append(query, fmt.Sprintf("%s/...", scope))
+			}
 		case viewLoadScope:
 			// If we are outside of GOPATH, a module, or some other known
 			// build system, don't load subdirectories.
@@ -92,6 +89,13 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 	}
 	sort.Strings(query) // for determinism
 
+	if s.view.Options().VerboseWorkDoneProgress {
+		work := s.view.session.progress.Start(ctx, "Load", fmt.Sprintf("Loading query=%s", query), nil, nil)
+		defer func() {
+			work.End("Done.")
+		}()
+	}
+
 	ctx, done := event.Start(ctx, "cache.view.load", tag.Query.Of(query))
 	defer done()
 
@@ -109,7 +113,7 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 	// Set a last resort deadline on packages.Load since it calls the go
 	// command, which may hang indefinitely if it has a bug. golang/go#42132
 	// and golang/go#42255 have more context.
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
 	cfg := s.config(ctx, inv)
@@ -147,9 +151,10 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 		}
 		// Special case for the builtin package, as it has no dependencies.
 		if pkg.PkgPath == "builtin" {
-			if err := s.buildBuiltinPackage(ctx, pkg.GoFiles); err != nil {
-				return err
+			if len(pkg.GoFiles) != 1 {
+				return errors.Errorf("only expected 1 file for builtin, got %v", len(pkg.GoFiles))
 			}
+			s.setBuiltin(pkg.GoFiles[0])
 			continue
 		}
 		// Skip test main packages.
@@ -162,11 +167,13 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 			continue
 		}
 		// Set the metadata for this package.
-		m, err := s.setMetadata(ctx, packagePath(pkg.PkgPath), pkg, cfg, map[packageID]struct{}{})
+		s.mu.Lock()
+		m, err := s.setMetadataLocked(ctx, PackagePath(pkg.PkgPath), pkg, cfg, query, map[PackageID]struct{}{})
+		s.mu.Unlock()
 		if err != nil {
 			return err
 		}
-		if _, err := s.buildPackageHandle(ctx, m.id, s.workspaceParseMode(m.id)); err != nil {
+		if _, err := s.buildPackageHandle(ctx, m.ID, s.workspaceParseMode(m.ID)); err != nil {
 			return err
 		}
 	}
@@ -203,11 +210,11 @@ func (s *snapshot) workspaceLayoutError(ctx context.Context) *source.CriticalErr
 	if !s.ValidBuildConfiguration() {
 		msg := `gopls requires a module at the root of your workspace.
 You can work with multiple modules by opening each one as a workspace folder.
-Improvements to this workflow will be coming soon (https://github.com/golang/go/issues/32394),
-and you can learn more here: https://github.com/golang/go/issues/36899.`
+Improvements to this workflow will be coming soon, and you can learn more here:
+https://github.com/golang/tools/blob/master/gopls/doc/workspace.md.`
 		return &source.CriticalError{
 			MainError: errors.Errorf(msg),
-			ErrorList: s.applyCriticalErrorToFiles(ctx, msg, openFiles),
+			DiagList:  s.applyCriticalErrorToFiles(ctx, msg, openFiles),
 		}
 	}
 
@@ -231,31 +238,33 @@ and you can learn more here: https://github.com/golang/go/issues/36899.`
 		// Add a diagnostic to each file in a nested module to mark it as
 		// "orphaned". Don't show a general diagnostic in the progress bar,
 		// because the user may still want to edit a file in a nested module.
-		var srcErrs []*source.Error
+		var srcDiags []*source.Diagnostic
 		for modDir, uris := range nestedModules {
 			msg := fmt.Sprintf(`This file is in %s, which is a nested module in the %s module.
 gopls currently requires one module per workspace folder.
 Please open %s as a separate workspace folder.
-You can learn more here: https://github.com/golang/go/issues/36899.
+You can learn more here: https://github.com/golang/tools/blob/master/gopls/doc/workspace.md.
 `, modDir, filepath.Dir(rootModURI.Filename()), modDir)
-			srcErrs = append(srcErrs, s.applyCriticalErrorToFiles(ctx, msg, uris)...)
+			srcDiags = append(srcDiags, s.applyCriticalErrorToFiles(ctx, msg, uris)...)
 		}
-		if len(srcErrs) != 0 {
+		if len(srcDiags) != 0 {
 			return &source.CriticalError{
-				MainError: errors.Errorf(`You are working in a nested module. Please open it as a separate workspace folder.`),
-				ErrorList: srcErrs,
+				MainError: errors.Errorf(`You are working in a nested module.
+Please open it as a separate workspace folder. Learn more:
+https://github.com/golang/tools/blob/master/gopls/doc/workspace.md.`),
+				DiagList: srcDiags,
 			}
 		}
 	}
 	return nil
 }
 
-func (s *snapshot) applyCriticalErrorToFiles(ctx context.Context, msg string, files []source.VersionedFileHandle) []*source.Error {
-	var srcErrs []*source.Error
+func (s *snapshot) applyCriticalErrorToFiles(ctx context.Context, msg string, files []source.VersionedFileHandle) []*source.Diagnostic {
+	var srcDiags []*source.Diagnostic
 	for _, fh := range files {
 		// Place the diagnostics on the package or module declarations.
 		var rng protocol.Range
-		switch fh.Kind() {
+		switch s.view.FileKind(fh) {
 		case source.Go:
 			if pgf, err := s.ParseGo(ctx, fh, source.ParseHeader); err == nil {
 				pkgDecl := span.NewRange(s.FileSet(), pgf.File.Package, pgf.File.Name.End())
@@ -270,14 +279,15 @@ func (s *snapshot) applyCriticalErrorToFiles(ctx context.Context, msg string, fi
 				}
 			}
 		}
-		srcErrs = append(srcErrs, &source.Error{
-			URI:     fh.URI(),
-			Range:   rng,
-			Kind:    source.ListError,
-			Message: msg,
+		srcDiags = append(srcDiags, &source.Diagnostic{
+			URI:      fh.URI(),
+			Range:    rng,
+			Severity: protocol.SeverityError,
+			Source:   source.ListError,
+			Message:  msg,
 		})
 	}
-	return srcErrs
+	return srcDiags
 }
 
 type workspaceDirKey string
@@ -353,81 +363,104 @@ func getWorkspaceDir(ctx context.Context, h *memoize.Handle, g *memoize.Generati
 	return span.URIFromPath(v.(*workspaceDirData).dir), nil
 }
 
-// setMetadata extracts metadata from pkg and records it in s. It
+// setMetadataLocked extracts metadata from pkg and records it in s. It
 // recurses through pkg.Imports to ensure that metadata exists for all
 // dependencies.
-func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *packages.Package, cfg *packages.Config, seen map[packageID]struct{}) (*metadata, error) {
-	id := packageID(pkg.ID)
+func (s *snapshot) setMetadataLocked(ctx context.Context, pkgPath PackagePath, pkg *packages.Package, cfg *packages.Config, query []string, seen map[PackageID]struct{}) (*Metadata, error) {
+	id := PackageID(pkg.ID)
+	if source.IsCommandLineArguments(pkg.ID) {
+		suffix := ":" + strings.Join(query, ",")
+		id = PackageID(string(id) + suffix)
+		pkgPath = PackagePath(string(pkgPath) + suffix)
+	}
 	if _, ok := seen[id]; ok {
 		return nil, errors.Errorf("import cycle detected: %q", id)
 	}
 	// Recreate the metadata rather than reusing it to avoid locking.
-	m := &metadata{
-		id:         id,
-		pkgPath:    pkgPath,
-		name:       packageName(pkg.Name),
-		forTest:    packagePath(packagesinternal.GetForTest(pkg)),
-		typesSizes: pkg.TypesSizes,
-		errors:     pkg.Errors,
-		config:     cfg,
-		module:     pkg.Module,
+	m := &Metadata{
+		ID:         id,
+		PkgPath:    pkgPath,
+		Name:       PackageName(pkg.Name),
+		ForTest:    PackagePath(packagesinternal.GetForTest(pkg)),
+		TypesSizes: pkg.TypesSizes,
+		Config:     cfg,
+		Module:     pkg.Module,
+		depsErrors: packagesinternal.GetDepsErrors(pkg),
 	}
 
+	for _, err := range pkg.Errors {
+		// Filter out parse errors from go list. We'll get them when we
+		// actually parse, and buggy overlay support may generate spurious
+		// errors. (See TestNewModule_Issue38207.)
+		if strings.Contains(err.Msg, "expected '") {
+			continue
+		}
+		m.Errors = append(m.Errors, err)
+	}
+
+	uris := map[span.URI]struct{}{}
 	for _, filename := range pkg.CompiledGoFiles {
 		uri := span.URIFromPath(filename)
-		m.compiledGoFiles = append(m.compiledGoFiles, uri)
-		s.addID(uri, m.id)
+		m.CompiledGoFiles = append(m.CompiledGoFiles, uri)
+		uris[uri] = struct{}{}
 	}
 	for _, filename := range pkg.GoFiles {
 		uri := span.URIFromPath(filename)
-		m.goFiles = append(m.goFiles, uri)
-		s.addID(uri, m.id)
+		m.GoFiles = append(m.GoFiles, uri)
+		uris[uri] = struct{}{}
 	}
+	s.updateIDForURIsLocked(id, uris)
 
 	// TODO(rstambler): is this still necessary?
-	copied := map[packageID]struct{}{
+	copied := map[PackageID]struct{}{
 		id: {},
 	}
 	for k, v := range seen {
 		copied[k] = v
 	}
 	for importPath, importPkg := range pkg.Imports {
-		importPkgPath := packagePath(importPath)
-		importID := packageID(importPkg.ID)
+		importPkgPath := PackagePath(importPath)
+		importID := PackageID(importPkg.ID)
 
-		m.deps = append(m.deps, importID)
+		m.Deps = append(m.Deps, importID)
 
 		// Don't remember any imports with significant errors.
 		if importPkgPath != "unsafe" && len(importPkg.CompiledGoFiles) == 0 {
-			if m.missingDeps == nil {
-				m.missingDeps = make(map[packagePath]struct{})
+			if m.MissingDeps == nil {
+				m.MissingDeps = make(map[PackagePath]struct{})
 			}
-			m.missingDeps[importPkgPath] = struct{}{}
+			m.MissingDeps[importPkgPath] = struct{}{}
 			continue
 		}
-		if s.getMetadata(importID) == nil {
-			if _, err := s.setMetadata(ctx, importPkgPath, importPkg, cfg, copied); err != nil {
+		if s.noValidMetadataForIDLocked(importID) {
+			if _, err := s.setMetadataLocked(ctx, importPkgPath, importPkg, cfg, query, copied); err != nil {
 				event.Error(ctx, "error in dependency", err)
 			}
 		}
 	}
 
 	// Add the metadata to the cache.
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	// TODO: We should make sure not to set duplicate metadata,
-	// and instead panic here. This can be done by making sure not to
-	// reset metadata information for packages we've already seen.
-	if original, ok := s.metadata[m.id]; ok {
-		m = original
+	// If we've already set the metadata for this snapshot, reuse it.
+	if original, ok := s.metadata[m.ID]; ok && original.Valid {
+		// Since we've just reloaded, clear out shouldLoad.
+		original.ShouldLoad = false
+		m = original.Metadata
 	} else {
-		s.metadata[m.id] = m
+		s.metadata[m.ID] = &KnownMetadata{
+			Metadata: m,
+			Valid:    true,
+		}
+		// Invalidate any packages we may have associated with this metadata.
+		for _, mode := range []source.ParseMode{source.ParseHeader, source.ParseExported, source.ParseFull} {
+			key := packageKey{mode, m.ID}
+			delete(s.packages, key)
+		}
 	}
 
 	// Set the workspace packages. If any of the package's files belong to the
 	// view, then the package may be a workspace package.
-	for _, uri := range append(m.compiledGoFiles, m.goFiles...) {
+	for _, uri := range append(m.CompiledGoFiles, m.GoFiles...) {
 		if !s.view.contains(uri) {
 			continue
 		}
@@ -439,15 +472,16 @@ func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *pa
 		}
 
 		switch {
-		case m.forTest == "":
+		case m.ForTest == "":
 			// A normal package.
-			s.workspacePackages[m.id] = pkgPath
-		case m.forTest == m.pkgPath, m.forTest+"_test" == m.pkgPath:
+			s.workspacePackages[m.ID] = pkgPath
+		case m.ForTest == m.PkgPath, m.ForTest+"_test" == m.PkgPath:
 			// The test variant of some workspace package or its x_test.
 			// To load it, we need to load the non-test variant with -test.
-			s.workspacePackages[m.id] = m.forTest
+			s.workspacePackages[m.ID] = m.ForTest
 		default:
 			// A test variant of some intermediate package. We don't care about it.
+			m.IsIntermediateTestVariant = true
 		}
 	}
 	return m, nil

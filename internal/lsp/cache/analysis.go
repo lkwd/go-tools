@@ -20,14 +20,17 @@ import (
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/memoize"
+	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
 )
 
-func (s *snapshot) Analyze(ctx context.Context, id string, analyzers ...*analysis.Analyzer) ([]*source.Error, error) {
+func (s *snapshot) Analyze(ctx context.Context, id string, analyzers []*source.Analyzer) ([]*source.Diagnostic, error) {
 	var roots []*actionHandle
-
 	for _, a := range analyzers {
-		ah, err := s.actionHandle(ctx, packageID(id), a)
+		if !a.IsEnabled(s.view) {
+			continue
+		}
+		ah, err := s.actionHandle(ctx, PackageID(id), a.Analyzer)
 		if err != nil {
 			return nil, err
 		}
@@ -39,11 +42,13 @@ func (s *snapshot) Analyze(ctx context.Context, id string, analyzers ...*analysi
 		return nil, ctx.Err()
 	}
 
-	var results []*source.Error
+	var results []*source.Diagnostic
 	for _, ah := range roots {
 		diagnostics, _, err := ah.analyze(ctx, s)
 		if err != nil {
-			return nil, err
+			// Keep going if a single analyzer failed.
+			event.Error(ctx, fmt.Sprintf("analyzer %q failed", ah.analyzer.Name), err)
+			continue
 		}
 		results = append(results, diagnostics...)
 	}
@@ -64,7 +69,7 @@ type actionHandle struct {
 }
 
 type actionData struct {
-	diagnostics  []*source.Error
+	diagnostics  []*source.Diagnostic
 	result       interface{}
 	objectFacts  map[objectFactKey]analysis.Fact
 	packageFacts map[packageFactKey]analysis.Fact
@@ -81,17 +86,17 @@ type packageFactKey struct {
 	typ reflect.Type
 }
 
-func (s *snapshot) actionHandle(ctx context.Context, id packageID, a *analysis.Analyzer) (*actionHandle, error) {
-	ph := s.getPackage(id, source.ParseFull)
-	if ph == nil {
-		return nil, errors.Errorf("no package for %s", id)
+func (s *snapshot) actionHandle(ctx context.Context, id PackageID, a *analysis.Analyzer) (*actionHandle, error) {
+	ph, err := s.buildPackageHandle(ctx, id, source.ParseFull)
+	if err != nil {
+		return nil, err
 	}
 	act := s.getActionHandle(id, ph.mode, a)
 	if act != nil {
 		return act, nil
 	}
 	if len(ph.key) == 0 {
-		return nil, errors.Errorf("no key for package %s", id)
+		return nil, errors.Errorf("actionHandle: no key for package %s", id)
 	}
 	pkg, err := ph.check(ctx, s)
 	if err != nil {
@@ -118,13 +123,13 @@ func (s *snapshot) actionHandle(ctx context.Context, id packageID, a *analysis.A
 		// An analysis that consumes/produces facts
 		// must run on the package's dependencies too.
 		if len(a.FactTypes) > 0 {
-			importIDs := make([]string, 0, len(ph.m.deps))
-			for _, importID := range ph.m.deps {
+			importIDs := make([]string, 0, len(ph.m.Deps))
+			for _, importID := range ph.m.Deps {
 				importIDs = append(importIDs, string(importID))
 			}
 			sort.Strings(importIDs) // for determinism
 			for _, importID := range importIDs {
-				depActionHandle, err := s.actionHandle(ctx, packageID(importID), a)
+				depActionHandle, err := s.actionHandle(ctx, PackageID(importID), a)
 				if err != nil {
 					return nil, err
 				}
@@ -150,7 +155,7 @@ func (s *snapshot) actionHandle(ctx context.Context, id packageID, a *analysis.A
 	return act, nil
 }
 
-func (act *actionHandle) analyze(ctx context.Context, snapshot *snapshot) ([]*source.Error, interface{}, error) {
+func (act *actionHandle) analyze(ctx context.Context, snapshot *snapshot) ([]*source.Diagnostic, interface{}, error) {
 	d, err := act.handle.Get(ctx, snapshot.generation, snapshot)
 	if err != nil {
 		return nil, nil, err
@@ -207,7 +212,6 @@ func runAnalysis(ctx context.Context, snapshot *snapshot, analyzer *analysis.Ana
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			event.Log(ctx, fmt.Sprintf("analysis panicked: %s", r), tag.Package.Of(pkg.ID()))
 			data.err = errors.Errorf("analysis %s for package %s panicked: %v", analyzer.Name, pkg.PkgPath(), r)
 		}
 	}()
@@ -255,7 +259,7 @@ func runAnalysis(ctx context.Context, snapshot *snapshot, analyzer *analysis.Ana
 	// Run the analysis.
 	pass := &analysis.Pass{
 		Analyzer:   analyzer,
-		Fset:       snapshot.view.session.cache.fset,
+		Fset:       snapshot.FileSet(),
 		Files:      syntax,
 		Pkg:        pkg.GetTypes(),
 		TypesInfo:  pkg.GetTypesInfo(),
@@ -323,7 +327,7 @@ func runAnalysis(ctx context.Context, snapshot *snapshot, analyzer *analysis.Ana
 	analysisinternal.SetTypeErrors(pass, pkg.typeErrors)
 
 	if pkg.IsIllTyped() {
-		data.err = errors.Errorf("analysis skipped due to errors in package: %v", pkg.GetErrors())
+		data.err = errors.Errorf("analysis skipped due to errors in package")
 		return data
 	}
 	data.result, data.err = pass.Analyzer.Run(pass)
@@ -347,7 +351,7 @@ func runAnalysis(ctx context.Context, snapshot *snapshot, analyzer *analysis.Ana
 	}
 
 	for _, diag := range diagnostics {
-		srcErr, err := sourceError(ctx, snapshot, pkg, diag)
+		srcDiags, err := analysisDiagnosticDiagnostics(snapshot, pkg, analyzer, diag)
 		if err != nil {
 			event.Error(ctx, "unable to compute analysis error position", err, tag.Category.Of(diag.Category), tag.Package.Of(pkg.ID()))
 			continue
@@ -356,7 +360,7 @@ func runAnalysis(ctx context.Context, snapshot *snapshot, analyzer *analysis.Ana
 			data.err = ctx.Err()
 			return data
 		}
-		data.diagnostics = append(data.diagnostics, srcErr)
+		data.diagnostics = append(data.diagnostics, srcDiags...)
 	}
 	return data
 }
@@ -386,7 +390,44 @@ func exportedFrom(obj types.Object, pkg *types.Package) bool {
 func factType(fact analysis.Fact) reflect.Type {
 	t := reflect.TypeOf(fact)
 	if t.Kind() != reflect.Ptr {
-		panic(fmt.Sprintf("invalid Fact type: got %T, want pointer", t))
+		panic(fmt.Sprintf("invalid Fact type: got %T, want pointer", fact))
 	}
 	return t
+}
+
+func (s *snapshot) DiagnosePackage(ctx context.Context, spkg source.Package) (map[span.URI][]*source.Diagnostic, error) {
+	pkg := spkg.(*pkg)
+	// Apply type error analyzers. They augment type error diagnostics with their own fixes.
+	var analyzers []*source.Analyzer
+	for _, a := range s.View().Options().TypeErrorAnalyzers {
+		analyzers = append(analyzers, a)
+	}
+	var errorAnalyzerDiag []*source.Diagnostic
+	if pkg.HasTypeErrors() {
+		var err error
+		errorAnalyzerDiag, err = s.Analyze(ctx, pkg.ID(), analyzers)
+		if err != nil {
+			// Keep going: analysis failures should not block diagnostics.
+			event.Error(ctx, "type error analysis failed", err, tag.Package.Of(pkg.ID()))
+		}
+	}
+	diags := map[span.URI][]*source.Diagnostic{}
+	for _, diag := range pkg.diagnostics {
+		for _, eaDiag := range errorAnalyzerDiag {
+			if eaDiag.URI == diag.URI && eaDiag.Range == diag.Range && eaDiag.Message == diag.Message {
+				// Type error analyzers just add fixes and tags. Make a copy,
+				// since we don't own either, and overwrite.
+				// The analyzer itself can't do this merge because
+				// analysis.Diagnostic doesn't have all the fields, and Analyze
+				// can't because it doesn't have the type error, notably its code.
+				clone := *diag
+				clone.SuggestedFixes = eaDiag.SuggestedFixes
+				clone.Tags = eaDiag.Tags
+				clone.Analyzer = eaDiag.Analyzer
+				diag = &clone
+			}
+		}
+		diags[diag.URI] = append(diags[diag.URI], diag)
+	}
+	return diags, nil
 }

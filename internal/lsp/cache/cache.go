@@ -29,7 +29,7 @@ import (
 	"golang.org/x/tools/internal/span"
 )
 
-func New(ctx context.Context, options func(*source.Options)) *Cache {
+func New(options func(*source.Options)) *Cache {
 	index := atomic.AddInt64(&cacheIndex, 1)
 	c := &Cache{
 		id:          strconv.FormatInt(index, 10),
@@ -168,10 +168,6 @@ func (h *fileHandle) URI() span.URI {
 	return h.uri
 }
 
-func (h *fileHandle) Kind() source.FileKind {
-	return source.DetectLanguage("", h.uri.Filename())
-}
-
 func (h *fileHandle) Hash() string {
 	return h.hash
 }
@@ -180,7 +176,6 @@ func (h *fileHandle) FileIdentity() source.FileIdentity {
 	return source.FileIdentity{
 		URI:  h.uri,
 		Hash: h.hash,
-		Kind: h.Kind(),
 	}
 }
 
@@ -198,7 +193,7 @@ func (c *Cache) ID() string                     { return c.id }
 func (c *Cache) MemStats() map[reflect.Type]int { return c.store.Stats() }
 
 type packageStat struct {
-	id        packageID
+	id        PackageID
 	mode      source.ParseMode
 	file      int64
 	ast       int64
@@ -224,7 +219,7 @@ func (c *Cache) PackageStats(withNames bool) template.HTML {
 				typInfoCost = typesInfoCost(v.pkg.typesInfo)
 			}
 			stat := packageStat{
-				id:        v.pkg.m.id,
+				id:        v.pkg.m.ID,
 				mode:      v.pkg.mode,
 				types:     typsCost,
 				typesInfo: typInfoCost,
@@ -270,7 +265,7 @@ func astCost(f *ast.File) int64 {
 		return 0
 	}
 	var count int64
-	ast.Inspect(f, func(n ast.Node) bool {
+	ast.Inspect(f, func(_ ast.Node) bool {
 		count += 32 // nodes are pretty small.
 		return true
 	})
