@@ -1,4 +1,4 @@
-// Copyright 2020 The Go Authors. All rights reserved.
+// Copyright 2021 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -20,6 +20,10 @@ func (s *Server) CodeLens(ctx context.Context, params *protocol.CodeLensParams) 
 	return s.codeLens(ctx, params)
 }
 
+func (s *Server) CodeLensRefresh(context.Context) error {
+	return notImplemented("CodeLensRefresh")
+}
+
 func (s *Server) ColorPresentation(context.Context, *protocol.ColorPresentationParams) ([]protocol.ColorPresentation, error) {
 	return nil, notImplemented("ColorPresentation")
 }
@@ -36,12 +40,28 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	return s.definition(ctx, params)
 }
 
+func (s *Server) Diagnostic(context.Context, *string) (*string, error) {
+	return nil, notImplemented("Diagnostic")
+}
+
+func (s *Server) DiagnosticRefresh(context.Context) error {
+	return notImplemented("DiagnosticRefresh")
+}
+
+func (s *Server) DiagnosticWorkspace(context.Context, *protocol.WorkspaceDiagnosticParams) (*protocol.WorkspaceDiagnosticReport, error) {
+	return nil, notImplemented("DiagnosticWorkspace")
+}
+
 func (s *Server) DidChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
 	return s.didChange(ctx, params)
 }
 
-func (s *Server) DidChangeConfiguration(ctx context.Context, _ *protocol.DidChangeConfigurationParams) error {
-	return s.didChangeConfiguration(ctx, nil)
+func (s *Server) DidChangeConfiguration(ctx context.Context, _gen *protocol.DidChangeConfigurationParams) error {
+	return s.didChangeConfiguration(ctx, _gen)
+}
+
+func (s *Server) DidChangeNotebookDocument(context.Context, *protocol.DidChangeNotebookDocumentParams) error {
+	return notImplemented("DidChangeNotebookDocument")
 }
 
 func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.DidChangeWatchedFilesParams) error {
@@ -56,8 +76,28 @@ func (s *Server) DidClose(ctx context.Context, params *protocol.DidCloseTextDocu
 	return s.didClose(ctx, params)
 }
 
+func (s *Server) DidCloseNotebookDocument(context.Context, *protocol.DidCloseNotebookDocumentParams) error {
+	return notImplemented("DidCloseNotebookDocument")
+}
+
+func (s *Server) DidCreateFiles(context.Context, *protocol.CreateFilesParams) error {
+	return notImplemented("DidCreateFiles")
+}
+
+func (s *Server) DidDeleteFiles(context.Context, *protocol.DeleteFilesParams) error {
+	return notImplemented("DidDeleteFiles")
+}
+
 func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
 	return s.didOpen(ctx, params)
+}
+
+func (s *Server) DidOpenNotebookDocument(context.Context, *protocol.DidOpenNotebookDocumentParams) error {
+	return notImplemented("DidOpenNotebookDocument")
+}
+
+func (s *Server) DidRenameFiles(context.Context, *protocol.RenameFilesParams) error {
+	return notImplemented("DidRenameFiles")
 }
 
 func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocumentParams) error {
@@ -116,6 +156,18 @@ func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedPa
 	return s.initialized(ctx, params)
 }
 
+func (s *Server) InlineValues(context.Context, *protocol.InlineValuesParams) ([]protocol.InlineValue, error) {
+	return nil, notImplemented("InlineValues")
+}
+
+func (s *Server) InlineValuesRefresh(context.Context) error {
+	return notImplemented("InlineValuesRefresh")
+}
+
+func (s *Server) LinkedEditingRange(context.Context, *protocol.LinkedEditingRangeParams) (*protocol.LinkedEditingRanges, error) {
+	return nil, notImplemented("LinkedEditingRange")
+}
+
 func (s *Server) LogTrace(context.Context, *protocol.LogTraceParams) error {
 	return notImplemented("LogTrace")
 }
@@ -140,8 +192,12 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 	return s.prepareCallHierarchy(ctx, params)
 }
 
-func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRenameParams) (*protocol.Range, error) {
+func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRenameParams) (*protocol.PrepareRename2Gn, error) {
 	return s.prepareRename(ctx, params)
+}
+
+func (s *Server) PrepareTypeHierarchy(context.Context, *protocol.TypeHierarchyPrepareParams) ([]protocol.TypeHierarchyItem, error) {
+	return nil, notImplemented("PrepareTypeHierarchy")
 }
 
 func (s *Server) RangeFormatting(context.Context, *protocol.DocumentRangeFormattingParams) ([]protocol.TextEdit, error) {
@@ -170,6 +226,10 @@ func (s *Server) ResolveCodeLens(context.Context, *protocol.CodeLens) (*protocol
 
 func (s *Server) ResolveDocumentLink(context.Context, *protocol.DocumentLink) (*protocol.DocumentLink, error) {
 	return nil, notImplemented("ResolveDocumentLink")
+}
+
+func (s *Server) ResolveWorkspaceSymbol(context.Context, *protocol.WorkspaceSymbol) (*protocol.WorkspaceSymbol, error) {
+	return nil, notImplemented("ResolveWorkspaceSymbol")
 }
 
 func (s *Server) SelectionRange(context.Context, *protocol.SelectionRangeParams) ([]protocol.SelectionRange, error) {
@@ -204,12 +264,32 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	return s.signatureHelp(ctx, params)
 }
 
+func (s *Server) Subtypes(context.Context, *protocol.TypeHierarchySubtypesParams) ([]protocol.TypeHierarchyItem, error) {
+	return nil, notImplemented("Subtypes")
+}
+
+func (s *Server) Supertypes(context.Context, *protocol.TypeHierarchySupertypesParams) ([]protocol.TypeHierarchyItem, error) {
+	return nil, notImplemented("Supertypes")
+}
+
 func (s *Server) Symbol(ctx context.Context, params *protocol.WorkspaceSymbolParams) ([]protocol.SymbolInformation, error) {
 	return s.symbol(ctx, params)
 }
 
 func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefinitionParams) (protocol.Definition, error) {
 	return s.typeDefinition(ctx, params)
+}
+
+func (s *Server) WillCreateFiles(context.Context, *protocol.CreateFilesParams) (*protocol.WorkspaceEdit, error) {
+	return nil, notImplemented("WillCreateFiles")
+}
+
+func (s *Server) WillDeleteFiles(context.Context, *protocol.DeleteFilesParams) (*protocol.WorkspaceEdit, error) {
+	return nil, notImplemented("WillDeleteFiles")
+}
+
+func (s *Server) WillRenameFiles(context.Context, *protocol.RenameFilesParams) (*protocol.WorkspaceEdit, error) {
+	return nil, notImplemented("WillRenameFiles")
 }
 
 func (s *Server) WillSave(context.Context, *protocol.WillSaveTextDocumentParams) error {

@@ -2,38 +2,59 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build go1.15
+// +build go1.15
+
 package hooks
 
 import (
-	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
+	"honnef.co/go/tools/analysis/lint"
+	"honnef.co/go/tools/quickfix"
 	"honnef.co/go/tools/simple"
 	"honnef.co/go/tools/staticcheck"
 	"honnef.co/go/tools/stylecheck"
 )
 
 func updateAnalyzers(options *source.Options) {
-	var analyzers []*analysis.Analyzer
-	for _, a := range simple.Analyzers {
-		analyzers = append(analyzers, a)
-	}
-	for _, a := range staticcheck.Analyzers {
-		switch a.Name {
-		case "SA5009":
-			// This check conflicts with the vet printf check (golang/go#34494).
-		case "SA5011":
-			// This check relies on facts from dependencies, which
-			// we don't currently compute.
+	mapSeverity := func(severity lint.Severity) protocol.DiagnosticSeverity {
+		switch severity {
+		case lint.SeverityError:
+			return protocol.SeverityError
+		case lint.SeverityDeprecated:
+			// TODO(dh): in LSP, deprecated is a tag, not a severity.
+			//   We'll want to support this once we enable SA5011.
+			return protocol.SeverityWarning
+		case lint.SeverityWarning:
+			return protocol.SeverityWarning
+		case lint.SeverityInfo:
+			return protocol.SeverityInformation
+		case lint.SeverityHint:
+			return protocol.SeverityHint
 		default:
-			analyzers = append(analyzers, a)
+			return protocol.SeverityWarning
 		}
 	}
-	for _, a := range stylecheck.Analyzers {
-		analyzers = append(analyzers, a)
+	add := func(analyzers []*lint.Analyzer, skip map[string]struct{}) {
+		for _, a := range analyzers {
+			if _, ok := skip[a.Analyzer.Name]; ok {
+				continue
+			}
+
+			enabled := !a.Doc.NonDefault
+			options.AddStaticcheckAnalyzer(a.Analyzer, enabled, mapSeverity(a.Doc.Severity))
+		}
 	}
-	// Always add hooks for all available analyzers, but disable them if the
-	// user does not have staticcheck enabled (they may enable it later on).
-	for _, a := range analyzers {
-		options.AddStaticcheckAnalyzer(a)
-	}
+
+	add(simple.Analyzers, nil)
+	add(staticcheck.Analyzers, map[string]struct{}{
+		// This check conflicts with the vet printf check (golang/go#34494).
+		"SA5009": {},
+		// This check relies on facts from dependencies, which
+		// we don't currently compute.
+		"SA5011": {},
+	})
+	add(stylecheck.Analyzers, nil)
+	add(quickfix.Analyzers, nil)
 }

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -26,11 +27,13 @@ import (
 	"golang.org/x/tools/go/expect"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/packages/packagestest"
+	"golang.org/x/tools/internal/lsp/command"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/lsp/source/completion"
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/testenv"
+	"golang.org/x/tools/internal/typeparams"
 	"golang.org/x/tools/txtar"
 )
 
@@ -38,9 +41,16 @@ const (
 	overlayFileSuffix = ".overlay"
 	goldenFileSuffix  = ".golden"
 	inFileSuffix      = ".in"
-	summaryFile       = "summary.txt"
 	testModule        = "golang.org/x/tools/internal/lsp"
 )
+
+var summaryFile = "summary.txt"
+
+func init() {
+	if typeparams.Enabled {
+		summaryFile = "summary_go1.18.txt"
+	}
+}
 
 var UpdateGolden = flag.Bool("golden", false, "Update golden files")
 
@@ -61,6 +71,7 @@ type Imports []span.Span
 type SemanticTokens []span.Span
 type SuggestedFixes map[span.Span][]string
 type FunctionExtractions map[span.Span]span.Span
+type MethodExtractions map[span.Span]span.Span
 type Definitions map[span.Span]Definition
 type Implementations map[span.Span][]span.Span
 type Highlights map[span.Span][]span.Span
@@ -73,6 +84,8 @@ type SymbolInformation map[span.Span]protocol.SymbolInformation
 type WorkspaceSymbols map[WorkspaceSymbolsTestType]map[span.URI][]string
 type Signatures map[span.Span]*protocol.SignatureHelp
 type Links map[span.URI][]Link
+type AddImport map[span.URI]string
+type Hovers map[span.Span]string
 
 type Data struct {
 	Config                   packages.Config
@@ -94,6 +107,7 @@ type Data struct {
 	SemanticTokens           SemanticTokens
 	SuggestedFixes           SuggestedFixes
 	FunctionExtractions      FunctionExtractions
+	MethodExtractions        MethodExtractions
 	Definitions              Definitions
 	Implementations          Implementations
 	Highlights               Highlights
@@ -106,6 +120,8 @@ type Data struct {
 	WorkspaceSymbols         WorkspaceSymbols
 	Signatures               Signatures
 	Links                    Links
+	AddImport                AddImport
+	Hovers                   Hovers
 
 	t         testing.TB
 	fragments map[string]string
@@ -136,6 +152,7 @@ type Tests interface {
 	SemanticTokens(*testing.T, span.Span)
 	SuggestedFix(*testing.T, span.Span, []string, int)
 	FunctionExtraction(*testing.T, span.Span, span.Span)
+	MethodExtraction(*testing.T, span.Span, span.Span)
 	Definition(*testing.T, span.Span, Definition)
 	Implementation(*testing.T, span.Span, []span.Span)
 	Highlight(*testing.T, span.Span, []span.Span)
@@ -146,6 +163,8 @@ type Tests interface {
 	WorkspaceSymbols(*testing.T, span.URI, string, WorkspaceSymbolsTestType)
 	SignatureHelp(*testing.T, span.Span, *protocol.SignatureHelp)
 	Link(*testing.T, span.URI, []Link)
+	AddImport(*testing.T, span.URI, string)
+	Hover(*testing.T, span.Span, string)
 }
 
 type Definition struct {
@@ -232,9 +251,11 @@ func DefaultOptions(o *source.Options) {
 		source.Mod: {
 			protocol.SourceOrganizeImports: true,
 		},
-		source.Sum: {},
+		source.Sum:  {},
+		source.Work: {},
+		source.Tmpl: {},
 	}
-	o.UserOptions.Codelenses[source.CommandTest.Name] = true
+	o.UserOptions.Codelenses[string(command.Test)] = true
 	o.HoverKind = source.SynopsisDocumentation
 	o.InsertTextFormat = protocol.SnippetTextFormat
 	o.CompletionBudget = time.Minute
@@ -251,20 +272,18 @@ func RunTests(t *testing.T, dataDir string, includeMultiModule bool, f func(*tes
 	}
 	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
-			t.Helper()
 			if mode == "MultiModule" {
 				// Some bug in 1.12 breaks reading markers, and it's not worth figuring out.
 				testenv.NeedsGo1Point(t, 13)
 			}
 			datum := load(t, mode, dataDir)
+			t.Helper()
 			f(t, datum)
 		})
 	}
 }
 
 func load(t testing.TB, mode string, dir string) *Data {
-	t.Helper()
-
 	datum := &Data{
 		CallHierarchy:            make(CallHierarchy),
 		CodeLens:                 make(CodeLens),
@@ -285,12 +304,15 @@ func load(t testing.TB, mode string, dir string) *Data {
 		PrepareRenames:           make(PrepareRenames),
 		SuggestedFixes:           make(SuggestedFixes),
 		FunctionExtractions:      make(FunctionExtractions),
+		MethodExtractions:        make(MethodExtractions),
 		Symbols:                  make(Symbols),
 		symbolsChildren:          make(SymbolsChildren),
 		symbolInformation:        make(SymbolInformation),
 		WorkspaceSymbols:         make(WorkspaceSymbols),
 		Signatures:               make(Signatures),
 		Links:                    make(Links),
+		AddImport:                make(AddImport),
+		Hovers:                   make(Hovers),
 
 		t:         t,
 		dir:       dir,
@@ -316,6 +338,14 @@ func load(t testing.TB, mode string, dir string) *Data {
 	}
 
 	files := packagestest.MustCopyFileTree(dir)
+	// Prune test cases that exercise generics.
+	if !typeparams.Enabled {
+		for name := range files {
+			if strings.Contains(name, "_generics") {
+				delete(files, name)
+			}
+		}
+	}
 	overlays := map[string][]byte{}
 	for fragment, operation := range files {
 		if trimmed := strings.TrimSuffix(fragment, goldenFileSuffix); trimmed != fragment {
@@ -433,7 +463,8 @@ func load(t testing.TB, mode string, dir string) *Data {
 		"godef":           datum.collectDefinitions,
 		"implementations": datum.collectImplementations,
 		"typdef":          datum.collectTypeDefinitions,
-		"hover":           datum.collectHoverDefinitions,
+		"hoverdef":        datum.collectHoverDefinitions,
+		"hover":           datum.collectHovers,
 		"highlight":       datum.collectHighlights,
 		"refs":            datum.collectReferences,
 		"rename":          datum.collectRenames,
@@ -443,8 +474,10 @@ func load(t testing.TB, mode string, dir string) *Data {
 		"link":            datum.collectLinks,
 		"suggestedfix":    datum.collectSuggestedFixes,
 		"extractfunc":     datum.collectFunctionExtractions,
+		"extractmethod":   datum.collectMethodExtractions,
 		"incomingcalls":   datum.collectIncomingCalls,
 		"outgoingcalls":   datum.collectOutgoingCalls,
+		"addimport":       datum.collectAddImports,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +490,7 @@ func load(t testing.TB, mode string, dir string) *Data {
 	// Collect names for the entries that require golden files.
 	if err := datum.Exported.Expect(map[string]interface{}{
 		"godef":                        datum.collectDefinitionNames,
-		"hover":                        datum.collectDefinitionNames,
+		"hoverdef":                     datum.collectDefinitionNames,
 		"workspacesymbol":              datum.collectWorkspaceSymbols(WorkspaceSymbolsDefault),
 		"workspacesymbolfuzzy":         datum.collectWorkspaceSymbols(WorkspaceSymbolsFuzzy),
 		"workspacesymbolcasesensitive": datum.collectWorkspaceSymbols(WorkspaceSymbolsCaseSensitive),
@@ -465,12 +498,49 @@ func load(t testing.TB, mode string, dir string) *Data {
 		t.Fatal(err)
 	}
 	if mode == "MultiModule" {
-		if err := os.Rename(filepath.Join(datum.Config.Dir, "go.mod"), filepath.Join(datum.Config.Dir, "testmodule/go.mod")); err != nil {
+		if err := moveFile(filepath.Join(datum.Config.Dir, "go.mod"), filepath.Join(datum.Config.Dir, "testmodule/go.mod")); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	return datum
+}
+
+// moveFile moves the file at oldpath to newpath, by renaming if possible
+// or copying otherwise.
+func moveFile(oldpath, newpath string) (err error) {
+	renameErr := os.Rename(oldpath, newpath)
+	if renameErr == nil {
+		return nil
+	}
+
+	src, err := os.Open(oldpath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		src.Close()
+		if err == nil {
+			err = os.Remove(oldpath)
+		}
+	}()
+
+	perm := os.ModePerm
+	fi, err := src.Stat()
+	if err == nil {
+		perm = fi.Mode().Perm()
+	}
+
+	dst, err := os.OpenFile(newpath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+
+	_, err = io.Copy(dst, src)
+	if closeErr := dst.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 func Run(t *testing.T, tests Tests, data *Data) {
@@ -652,6 +722,20 @@ func Run(t *testing.T, tests Tests, data *Data) {
 		}
 	})
 
+	t.Run("MethodExtraction", func(t *testing.T) {
+		t.Helper()
+		for start, end := range data.MethodExtractions {
+			// Check if we should skip this spn if the -modfile flag is not available.
+			if shouldSkip(data, start.URI()) {
+				continue
+			}
+			t.Run(SpanName(start), func(t *testing.T) {
+				t.Helper()
+				tests.MethodExtraction(t, start, end)
+			})
+		}
+	})
+
 	t.Run("Definition", func(t *testing.T) {
 		t.Helper()
 		for spn, d := range data.Definitions {
@@ -684,6 +768,16 @@ func Run(t *testing.T, tests Tests, data *Data) {
 			t.Run(SpanName(pos), func(t *testing.T) {
 				t.Helper()
 				tests.Highlight(t, pos, locations)
+			})
+		}
+	})
+
+	t.Run("Hover", func(t *testing.T) {
+		t.Helper()
+		for pos, info := range data.Hovers {
+			t.Run(SpanName(pos), func(t *testing.T) {
+				t.Helper()
+				tests.Hover(t, pos, info)
 			})
 		}
 	})
@@ -784,6 +878,15 @@ func Run(t *testing.T, tests Tests, data *Data) {
 		}
 	})
 
+	t.Run("AddImport", func(t *testing.T) {
+		t.Helper()
+		for uri, exp := range data.AddImport {
+			t.Run(uriName(uri), func(t *testing.T) {
+				tests.AddImport(t, uri, exp)
+			})
+		}
+	})
+
 	if *UpdateGolden {
 		for _, golden := range data.golden {
 			if !golden.Modified {
@@ -863,6 +966,7 @@ func checkData(t *testing.T, data *Data) {
 	fmt.Fprintf(buf, "SemanticTokenCount = %v\n", len(data.SemanticTokens))
 	fmt.Fprintf(buf, "SuggestedFixCount = %v\n", len(data.SuggestedFixes))
 	fmt.Fprintf(buf, "FunctionExtractionCount = %v\n", len(data.FunctionExtractions))
+	fmt.Fprintf(buf, "MethodExtractionCount = %v\n", len(data.MethodExtractions))
 	fmt.Fprintf(buf, "DefinitionsCount = %v\n", definitionCount)
 	fmt.Fprintf(buf, "TypeDefinitionsCount = %v\n", typeDefinitionCount)
 	fmt.Fprintf(buf, "HighlightsCount = %v\n", len(data.Highlights))
@@ -1004,7 +1108,7 @@ func (data *Data) collectDiagnostics(spn span.Span, msgSource, msg, msgSeverity 
 	want := &source.Diagnostic{
 		Range:    rng,
 		Severity: severity,
-		Source:   msgSource,
+		Source:   source.DiagnosticSource(msgSource),
 		Message:  msg,
 	}
 	data.Diagnostics[spn.URI()] = append(data.Diagnostics[spn.URI()], want)
@@ -1075,6 +1179,10 @@ func (data *Data) collectImports(spn span.Span) {
 	data.Imports = append(data.Imports, spn)
 }
 
+func (data *Data) collectAddImports(spn span.Span, imp string) {
+	data.AddImport[spn.URI()] = imp
+}
+
 func (data *Data) collectSemanticTokens(spn span.Span) {
 	data.SemanticTokens = append(data.SemanticTokens, spn)
 }
@@ -1089,6 +1197,12 @@ func (data *Data) collectSuggestedFixes(spn span.Span, actionKind string) {
 func (data *Data) collectFunctionExtractions(start span.Span, end span.Span) {
 	if _, ok := data.FunctionExtractions[start]; !ok {
 		data.FunctionExtractions[start] = end
+	}
+}
+
+func (data *Data) collectMethodExtractions(start span.Span, end span.Span) {
+	if _, ok := data.MethodExtractions[start]; !ok {
+		data.MethodExtractions[start] = end
 	}
 }
 
@@ -1158,6 +1272,10 @@ func (data *Data) collectHoverDefinitions(src, target span.Span) {
 		Def:       target,
 		OnlyHover: true,
 	}
+}
+
+func (data *Data) collectHovers(src span.Span, expected string) {
+	data.Hovers[src] = expected
 }
 
 func (data *Data) collectTypeDefinitions(src, target span.Span) {
@@ -1258,7 +1376,7 @@ func (data *Data) collectSignatures(spn span.Span, signature string, activeParam
 				Label: signature,
 			},
 		},
-		ActiveParameter: float64(activeParam),
+		ActiveParameter: uint32(activeParam),
 	}
 	// Hardcode special case to test the lack of a signature.
 	if signature == "" && activeParam == 0 {

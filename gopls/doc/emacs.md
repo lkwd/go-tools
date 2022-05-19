@@ -3,7 +3,7 @@
 ## Installing `gopls`
 
 To use `gopls` with Emacs, you must first
-[install the `gopls` binary](user.md#installation) and ensure that the directory
+[install the `gopls` binary](../README.md#installation) and ensure that the directory
 containing the resulting binary (either `$(go env GOBIN)` or `$(go env
 GOPATH)/bin`) is in your `PATH`.
 
@@ -121,14 +121,20 @@ project root.
 See [settings] for information about available gopls settings.
 
 LSP server settings are controlled by the `eglot-workspace-configuration`
-variable, which can be set either globally in `.emacs` (as below) or in a
-`.dir-locals.el` file in the project root.
+variable, which can be set either globally in `.emacs` or in a `.dir-locals.el` file in the project root.
 
+`.emacs`:
 ```elisp
 (setq-default eglot-workspace-configuration
     '((:gopls .
         ((staticcheck . t)
          (matcher . "CaseSensitive")))))
+```
+
+`.dir-locals.el`:
+```elisp
+((nil (eglot-workspace-configuration . ((gopls . ((staticcheck . t)
+						  (matcher . "CaseSensitive")))))))
 ```
 
 ### Organizing imports with Eglot

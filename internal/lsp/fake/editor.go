@@ -9,14 +9,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 
 	"golang.org/x/tools/internal/jsonrpc2"
+	"golang.org/x/tools/internal/lsp/command"
 	"golang.org/x/tools/internal/lsp/protocol"
-	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
 )
@@ -41,25 +42,33 @@ type Editor struct {
 	buffers map[string]buffer
 	// Capabilities / Options
 	serverCapabilities protocol.ServerCapabilities
+
 	// Call metrics for the purpose of expectations. This is done in an ad-hoc
 	// manner for now. Perhaps in the future we should do something more
-	// systematic.
-	calls CallCounts
+	// systematic. Guarded with a separate mutex as calls may need to be accessed
+	// asynchronously via callbacks into the Editor.
+	callsMu sync.Mutex
+	calls   CallCounts
 }
 
 type CallCounts struct {
-	DidOpen, DidChange, DidChangeWatchedFiles int
+	DidOpen, DidChange, DidSave, DidChangeWatchedFiles, DidClose uint64
 }
 
 type buffer struct {
-	version int
-	path    string
-	content []string
-	dirty   bool
+	windowsLineEndings bool
+	version            int
+	path               string
+	lines              []string
+	dirty              bool
 }
 
 func (b buffer) text() string {
-	return strings.Join(b.content, "\n")
+	eol := "\n"
+	if b.windowsLineEndings {
+		eol = "\r\n"
+	}
+	return strings.Join(b.lines, eol)
 }
 
 // EditorConfig configures the editor's LSP session. This is similar to
@@ -103,9 +112,25 @@ type EditorConfig struct {
 	// the PID. This can only be set by one test.
 	SendPID bool
 
-	DirectoryFilters []string
+	// Whether to edit files with windows line endings.
+	WindowsLineEndings bool
 
-	VerboseOutput bool
+	// Map of language ID -> regexp to match, used to set the file type of new
+	// buffers. Applied as an overlay on top of the following defaults:
+	//  "go" -> ".*\.go"
+	//  "go.mod" -> "go\.mod"
+	//  "go.sum" -> "go\.sum"
+	//  "gotmpl" -> ".*tmpl"
+	FileAssociations map[string]string
+
+	// Settings holds arbitrary additional settings to apply to the gopls config.
+	// TODO(rfindley): replace existing EditorConfig fields with Settings.
+	Settings map[string]interface{}
+
+	ImportShortcut                 string
+	DirectoryFilters               []string
+	VerboseOutput                  bool
+	ExperimentalUseInvalidMetadata bool
 }
 
 // NewEditor Creates a new Editor.
@@ -140,8 +165,8 @@ func (e *Editor) Connect(ctx context.Context, conn jsonrpc2.Conn, hooks ClientHo
 }
 
 func (e *Editor) Stats() CallCounts {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.callsMu.Lock()
+	defer e.callsMu.Unlock()
 	return e.calls
 }
 
@@ -193,9 +218,11 @@ func (e *Editor) Client() *Client {
 func (e *Editor) overlayEnv() map[string]string {
 	env := make(map[string]string)
 	for k, v := range e.defaultEnv {
+		v = strings.ReplaceAll(v, "$SANDBOX_WORKDIR", e.sandbox.Workdir.RootURI().SpanURI().Filename())
 		env[k] = v
 	}
 	for k, v := range e.Config.Env {
+		v = strings.ReplaceAll(v, "$SANDBOX_WORKDIR", e.sandbox.Workdir.RootURI().SpanURI().Filename())
 		env[k] = v
 	}
 	return env
@@ -209,11 +236,18 @@ func (e *Editor) configuration() map[string]interface{} {
 		"completionBudget":        "10s",
 	}
 
+	for k, v := range e.Config.Settings {
+		config[k] = v
+	}
+
 	if e.Config.BuildFlags != nil {
 		config["buildFlags"] = e.Config.BuildFlags
 	}
 	if e.Config.DirectoryFilters != nil {
 		config["directoryFilters"] = e.Config.DirectoryFilters
+	}
+	if e.Config.ExperimentalUseInvalidMetadata {
+		config["experimentalUseInvalidMetadata"] = true
 	}
 	if e.Config.CodeLenses != nil {
 		config["codelenses"] = e.Config.CodeLenses
@@ -235,9 +269,11 @@ func (e *Editor) configuration() map[string]interface{} {
 		config["verboseOutput"] = true
 	}
 
-	// TODO(rFindley): change to the new settings name once it is no longer
-	// designated experimental.
-	config["experimentalDiagnosticsDelay"] = "10ms"
+	if e.Config.ImportShortcut != "" {
+		config["importShortcut"] = e.Config.ImportShortcut
+	}
+
+	config["diagnosticsDelay"] = "10ms"
 
 	// ExperimentalWorkspaceModule is only set as a mode, not a configuration.
 	return config
@@ -261,9 +297,20 @@ func (e *Editor) initialize(ctx context.Context, workspaceFolders []string) erro
 	params.Capabilities.Workspace.Configuration = true
 	params.Capabilities.Window.WorkDoneProgress = true
 	// TODO: set client capabilities
+	params.Capabilities.TextDocument.Completion.CompletionItem.TagSupport.ValueSet = []protocol.CompletionItemTag{protocol.ComplDeprecated}
 	params.InitializationOptions = e.configuration()
 	if e.Config.SendPID {
-		params.ProcessID = float64(os.Getpid())
+		params.ProcessID = int32(os.Getpid())
+	}
+
+	params.Capabilities.TextDocument.Completion.CompletionItem.SnippetSupport = true
+	params.Capabilities.TextDocument.SemanticTokens.Requests.Full = true
+	// copied from lsp/semantic.go to avoid import cycle in tests
+	params.Capabilities.TextDocument.SemanticTokens.TokenTypes = []string{
+		"namespace", "type", "class", "enum", "interface",
+		"struct", "typeParameter", "parameter", "variable", "property", "enumMember",
+		"event", "function", "method", "macro", "keyword", "modifier", "comment",
+		"string", "number", "regexp", "operator",
 	}
 
 	// This is a bit of a hack, since the fake editor doesn't actually support
@@ -291,36 +338,52 @@ func (e *Editor) initialize(ctx context.Context, workspaceFolders []string) erro
 	return nil
 }
 
+// onFileChanges is registered to be called by the Workdir on any writes that
+// go through the Workdir API. It is called synchronously by the Workdir.
 func (e *Editor) onFileChanges(ctx context.Context, evts []FileEvent) {
 	if e.Server == nil {
 		return
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	var lspevts []protocol.FileEvent
-	for _, evt := range evts {
-		// Always send an on-disk change, even for events that seem useless
-		// because they're shadowed by an open buffer.
-		lspevts = append(lspevts, evt.ProtocolEvent)
 
-		if buf, ok := e.buffers[evt.Path]; ok {
-			// Following VS Code, don't honor deletions or changes to dirty buffers.
-			if buf.dirty || evt.ProtocolEvent.Type == protocol.Deleted {
-				continue
-			}
-
-			content, err := e.sandbox.Workdir.ReadFile(evt.Path)
-			if err != nil {
-				continue // A race with some other operation.
-			}
-			// During shutdown, this call will fail. Ignore the error.
-			_ = e.setBufferContentLocked(ctx, evt.Path, false, strings.Split(content, "\n"), nil)
-		}
-	}
-	e.Server.DidChangeWatchedFiles(ctx, &protocol.DidChangeWatchedFilesParams{
-		Changes: lspevts,
-	})
+	// e may be locked when onFileChanges is called, but it is important that we
+	// synchronously increment this counter so that we can subsequently assert on
+	// the number of expected DidChangeWatchedFiles calls.
+	e.callsMu.Lock()
 	e.calls.DidChangeWatchedFiles++
+	e.callsMu.Unlock()
+
+	// Since e may be locked, we must run this mutation asynchronously.
+	go func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		var lspevts []protocol.FileEvent
+		for _, evt := range evts {
+			// Always send an on-disk change, even for events that seem useless
+			// because they're shadowed by an open buffer.
+			lspevts = append(lspevts, evt.ProtocolEvent)
+
+			if buf, ok := e.buffers[evt.Path]; ok {
+				// Following VS Code, don't honor deletions or changes to dirty buffers.
+				if buf.dirty || evt.ProtocolEvent.Type == protocol.Deleted {
+					continue
+				}
+
+				content, err := e.sandbox.Workdir.ReadFile(evt.Path)
+				if err != nil {
+					continue // A race with some other operation.
+				}
+				// No need to update if the buffer content hasn't changed.
+				if content == buf.text() {
+					continue
+				}
+				// During shutdown, this call will fail. Ignore the error.
+				_ = e.setBufferContentLocked(ctx, evt.Path, false, lines(content), nil)
+			}
+		}
+		e.Server.DidChangeWatchedFiles(ctx, &protocol.DidChangeWatchedFilesParams{
+			Changes: lspevts,
+		})
+	}()
 }
 
 // OpenFile creates a buffer for the given workdir-relative file.
@@ -332,21 +395,6 @@ func (e *Editor) OpenFile(ctx context.Context, path string) error {
 	return e.createBuffer(ctx, path, false, content)
 }
 
-func textDocumentItem(wd *Workdir, buf buffer) protocol.TextDocumentItem {
-	uri := wd.URI(buf.path)
-	languageID := ""
-	if strings.HasSuffix(buf.path, ".go") {
-		// TODO: what about go.mod files? What is their language ID?
-		languageID = "go"
-	}
-	return protocol.TextDocumentItem{
-		URI:        uri,
-		LanguageID: languageID,
-		Version:    float64(buf.version),
-		Text:       buf.text(),
-	}
-}
-
 // CreateBuffer creates a new unsaved buffer corresponding to the workdir path,
 // containing the given textual content.
 func (e *Editor) CreateBuffer(ctx context.Context, path, content string) error {
@@ -355,15 +403,22 @@ func (e *Editor) CreateBuffer(ctx context.Context, path, content string) error {
 
 func (e *Editor) createBuffer(ctx context.Context, path string, dirty bool, content string) error {
 	buf := buffer{
-		version: 1,
-		path:    path,
-		content: strings.Split(content, "\n"),
-		dirty:   dirty,
+		windowsLineEndings: e.Config.WindowsLineEndings,
+		version:            1,
+		path:               path,
+		lines:              lines(content),
+		dirty:              dirty,
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.buffers[path] = buf
-	item := textDocumentItem(e.sandbox.Workdir, buf)
+
+	item := protocol.TextDocumentItem{
+		URI:        e.sandbox.Workdir.URI(buf.path),
+		LanguageID: e.languageID(buf.path),
+		Version:    int32(buf.version),
+		Text:       buf.text(),
+	}
 
 	if e.Server != nil {
 		if err := e.Server.DidOpen(ctx, &protocol.DidOpenTextDocumentParams{
@@ -371,9 +426,44 @@ func (e *Editor) createBuffer(ctx context.Context, path string, dirty bool, cont
 		}); err != nil {
 			return errors.Errorf("DidOpen: %w", err)
 		}
+		e.callsMu.Lock()
 		e.calls.DidOpen++
+		e.callsMu.Unlock()
 	}
 	return nil
+}
+
+var defaultFileAssociations = map[string]*regexp.Regexp{
+	"go":      regexp.MustCompile(`^.*\.go$`), // '$' is important: don't match .gotmpl!
+	"go.mod":  regexp.MustCompile(`^go\.mod$`),
+	"go.sum":  regexp.MustCompile(`^go(\.work)?\.sum$`),
+	"go.work": regexp.MustCompile(`^go\.work$`),
+	"gotmpl":  regexp.MustCompile(`^.*tmpl$`),
+}
+
+func (e *Editor) languageID(p string) string {
+	base := path.Base(p)
+	for lang, re := range e.Config.FileAssociations {
+		re := regexp.MustCompile(re)
+		if re.MatchString(base) {
+			return lang
+		}
+	}
+	for lang, re := range defaultFileAssociations {
+		if re.MatchString(base) {
+			return lang
+		}
+	}
+	return ""
+}
+
+// lines returns line-ending agnostic line representation of content.
+func lines(content string) []string {
+	lines := strings.Split(content, "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimSuffix(l, "\r")
+	}
+	return lines
 }
 
 // CloseBuffer removes the current buffer (regardless of whether it is saved).
@@ -393,6 +483,9 @@ func (e *Editor) CloseBuffer(ctx context.Context, path string) error {
 		}); err != nil {
 			return errors.Errorf("DidClose: %w", err)
 		}
+		e.callsMu.Lock()
+		e.calls.DidClose++
+		e.callsMu.Unlock()
 	}
 	return nil
 }
@@ -447,10 +540,7 @@ func (e *Editor) SaveBufferWithoutActions(ctx context.Context, path string) erro
 
 	if e.Server != nil {
 		params := &protocol.DidSaveTextDocumentParams{
-			TextDocument: protocol.VersionedTextDocumentIdentifier{
-				Version:                float64(buf.version),
-				TextDocumentIdentifier: docID,
-			},
+			TextDocument: docID,
 		}
 		if includeText {
 			params.Text = &content
@@ -458,6 +548,9 @@ func (e *Editor) SaveBufferWithoutActions(ctx context.Context, path string) erro
 		if err := e.Server.DidSave(ctx, params); err != nil {
 			return errors.Errorf("DidSave: %w", err)
 		}
+		e.callsMu.Lock()
+		e.calls.DidSave++
+		e.callsMu.Unlock()
 	}
 	return nil
 }
@@ -495,6 +588,7 @@ var (
 // regexpRange returns the start and end of the first occurrence of either re
 // or its singular subgroup. It returns ErrNoMatch if the regexp doesn't match.
 func regexpRange(content, re string) (Pos, Pos, error) {
+	content = normalizeEOL(content)
 	var start, end int
 	rec, err := regexp.Compile(re)
 	if err != nil {
@@ -523,6 +617,10 @@ func regexpRange(content, re string) (Pos, Pos, error) {
 		return Pos{}, Pos{}, err
 	}
 	return startPos, endPos, nil
+}
+
+func normalizeEOL(content string) string {
+	return strings.Join(lines(content), "\n")
 }
 
 // RegexpRange returns the first range in the buffer bufName matching re. See
@@ -582,7 +680,7 @@ func (e *Editor) EditBuffer(ctx context.Context, path string, edits []Edit) erro
 func (e *Editor) SetBufferContent(ctx context.Context, path, content string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	lines := strings.Split(content, "\n")
+	lines := lines(content)
 	return e.setBufferContentLocked(ctx, path, true, lines, nil)
 }
 
@@ -614,8 +712,8 @@ func (e *Editor) editBufferLocked(ctx context.Context, path string, edits []Edit
 	if !ok {
 		return fmt.Errorf("unknown buffer %q", path)
 	}
-	content := make([]string, len(buf.content))
-	copy(content, buf.content)
+	content := make([]string, len(buf.lines))
+	copy(content, buf.lines)
 	content, err := editContent(content, edits)
 	if err != nil {
 		return err
@@ -628,7 +726,7 @@ func (e *Editor) setBufferContentLocked(ctx context.Context, path string, dirty 
 	if !ok {
 		return fmt.Errorf("unknown buffer %q", path)
 	}
-	buf.content = content
+	buf.lines = content
 	buf.version++
 	buf.dirty = dirty
 	e.buffers[path] = buf
@@ -644,7 +742,7 @@ func (e *Editor) setBufferContentLocked(ctx context.Context, path string, dirty 
 	}
 	params := &protocol.DidChangeTextDocumentParams{
 		TextDocument: protocol.VersionedTextDocumentIdentifier{
-			Version:                float64(buf.version),
+			Version:                int32(buf.version),
 			TextDocumentIdentifier: e.textDocumentIdentifier(buf.path),
 		},
 		ContentChanges: evts,
@@ -653,13 +751,15 @@ func (e *Editor) setBufferContentLocked(ctx context.Context, path string, dirty 
 		if err := e.Server.DidChange(ctx, params); err != nil {
 			return errors.Errorf("DidChange: %w", err)
 		}
+		e.callsMu.Lock()
 		e.calls.DidChange++
+		e.callsMu.Unlock()
 	}
 	return nil
 }
 
 // GoToDefinition jumps to the definition of the symbol at the given position
-// in an open buffer.
+// in an open buffer. It returns the path and position of the resulting jump.
 func (e *Editor) GoToDefinition(ctx context.Context, path string, pos Pos) (string, Pos, error) {
 	if err := e.checkBufferPosition(path, pos); err != nil {
 		return "", Pos{}, err
@@ -672,11 +772,35 @@ func (e *Editor) GoToDefinition(ctx context.Context, path string, pos Pos) (stri
 	if err != nil {
 		return "", Pos{}, errors.Errorf("definition: %w", err)
 	}
-	if len(resp) == 0 {
+	return e.extractFirstPathAndPos(ctx, resp)
+}
+
+// GoToTypeDefinition jumps to the type definition of the symbol at the given position
+// in an open buffer.
+func (e *Editor) GoToTypeDefinition(ctx context.Context, path string, pos Pos) (string, Pos, error) {
+	if err := e.checkBufferPosition(path, pos); err != nil {
+		return "", Pos{}, err
+	}
+	params := &protocol.TypeDefinitionParams{}
+	params.TextDocument.URI = e.sandbox.Workdir.URI(path)
+	params.Position = pos.ToProtocolPosition()
+
+	resp, err := e.Server.TypeDefinition(ctx, params)
+	if err != nil {
+		return "", Pos{}, errors.Errorf("type definition: %w", err)
+	}
+	return e.extractFirstPathAndPos(ctx, resp)
+}
+
+// extractFirstPathAndPos returns the path and the position of the first location.
+// It opens the file if needed.
+func (e *Editor) extractFirstPathAndPos(ctx context.Context, locs []protocol.Location) (string, Pos, error) {
+	if len(locs) == 0 {
 		return "", Pos{}, nil
 	}
-	newPath := e.sandbox.Workdir.URIToPath(resp[0].URI)
-	newPos := fromProtocolPosition(resp[0].Range.Start)
+
+	newPath := e.sandbox.Workdir.URIToPath(locs[0].URI)
+	newPos := fromProtocolPosition(locs[0].Range.Start)
 	if !e.HasBuffer(newPath) {
 		if err := e.OpenFile(ctx, newPath); err != nil {
 			return "", Pos{}, errors.Errorf("OpenFile: %w", err)
@@ -719,39 +843,69 @@ func (e *Editor) Symbol(ctx context.Context, query string) ([]SymbolInformation,
 
 // OrganizeImports requests and performs the source.organizeImports codeAction.
 func (e *Editor) OrganizeImports(ctx context.Context, path string) error {
-	return e.codeAction(ctx, path, nil, nil, protocol.SourceOrganizeImports)
+	_, err := e.applyCodeActions(ctx, path, nil, nil, protocol.SourceOrganizeImports)
+	return err
 }
 
 // RefactorRewrite requests and performs the source.refactorRewrite codeAction.
 func (e *Editor) RefactorRewrite(ctx context.Context, path string, rng *protocol.Range) error {
-	return e.codeAction(ctx, path, rng, nil, protocol.RefactorRewrite)
+	applied, err := e.applyCodeActions(ctx, path, rng, nil, protocol.RefactorRewrite)
+	if applied == 0 {
+		return errors.Errorf("no refactorings were applied")
+	}
+	return err
 }
 
 // ApplyQuickFixes requests and performs the quickfix codeAction.
 func (e *Editor) ApplyQuickFixes(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic) error {
-	return e.codeAction(ctx, path, rng, diagnostics, protocol.QuickFix, protocol.SourceFixAll)
+	applied, err := e.applyCodeActions(ctx, path, rng, diagnostics, protocol.SourceFixAll, protocol.QuickFix)
+	if applied == 0 {
+		return errors.Errorf("no quick fixes were applied")
+	}
+	return err
 }
 
-func (e *Editor) codeAction(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic, only ...protocol.CodeActionKind) error {
-	if e.Server == nil {
-		return nil
+// ApplyCodeAction applies the given code action.
+func (e *Editor) ApplyCodeAction(ctx context.Context, action protocol.CodeAction) error {
+	for _, change := range action.Edit.DocumentChanges {
+		path := e.sandbox.Workdir.URIToPath(change.TextDocument.URI)
+		if int32(e.buffers[path].version) != change.TextDocument.Version {
+			// Skip edits for old versions.
+			continue
+		}
+		edits := convertEdits(change.Edits)
+		if err := e.EditBuffer(ctx, path, edits); err != nil {
+			return errors.Errorf("editing buffer %q: %w", path, err)
+		}
 	}
-	params := &protocol.CodeActionParams{}
-	params.TextDocument.URI = e.sandbox.Workdir.URI(path)
-	params.Context.Only = only
-	if diagnostics != nil {
-		params.Context.Diagnostics = diagnostics
+	// Execute any commands. The specification says that commands are
+	// executed after edits are applied.
+	if action.Command != nil {
+		if _, err := e.ExecuteCommand(ctx, &protocol.ExecuteCommandParams{
+			Command:   action.Command.Command,
+			Arguments: action.Command.Arguments,
+		}); err != nil {
+			return err
+		}
 	}
-	if rng != nil {
-		params.Range = *rng
-	}
-	actions, err := e.Server.CodeAction(ctx, params)
+	// Some commands may edit files on disk.
+	return e.sandbox.Workdir.CheckForFileChanges(ctx)
+}
+
+// GetQuickFixes returns the available quick fix code actions.
+func (e *Editor) GetQuickFixes(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic) ([]protocol.CodeAction, error) {
+	return e.getCodeActions(ctx, path, rng, diagnostics, protocol.QuickFix, protocol.SourceFixAll)
+}
+
+func (e *Editor) applyCodeActions(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic, only ...protocol.CodeActionKind) (int, error) {
+	actions, err := e.getCodeActions(ctx, path, rng, diagnostics, only...)
 	if err != nil {
-		return errors.Errorf("textDocument/codeAction: %w", err)
+		return 0, err
 	}
+	applied := 0
 	for _, action := range actions {
 		if action.Title == "" {
-			return errors.Errorf("empty title for code action")
+			return 0, errors.Errorf("empty title for code action")
 		}
 		var match bool
 		for _, o := range only {
@@ -763,33 +917,28 @@ func (e *Editor) codeAction(ctx context.Context, path string, rng *protocol.Rang
 		if !match {
 			continue
 		}
-		for _, change := range action.Edit.DocumentChanges {
-			path := e.sandbox.Workdir.URIToPath(change.TextDocument.URI)
-			if float64(e.buffers[path].version) != change.TextDocument.Version {
-				// Skip edits for old versions.
-				continue
-			}
-			edits := convertEdits(change.Edits)
-			if err := e.EditBuffer(ctx, path, edits); err != nil {
-				return errors.Errorf("editing buffer %q: %w", path, err)
-			}
-		}
-		// Execute any commands. The specification says that commands are
-		// executed after edits are applied.
-		if action.Command != nil {
-			if _, err := e.ExecuteCommand(ctx, &protocol.ExecuteCommandParams{
-				Command:   action.Command.Command,
-				Arguments: action.Command.Arguments,
-			}); err != nil {
-				return err
-			}
-		}
-		// Some commands may edit files on disk.
-		if err := e.sandbox.Workdir.CheckForFileChanges(ctx); err != nil {
-			return err
+		applied++
+		if err := e.ApplyCodeAction(ctx, action); err != nil {
+			return 0, err
 		}
 	}
-	return nil
+	return applied, nil
+}
+
+func (e *Editor) getCodeActions(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic, only ...protocol.CodeActionKind) ([]protocol.CodeAction, error) {
+	if e.Server == nil {
+		return nil, nil
+	}
+	params := &protocol.CodeActionParams{}
+	params.TextDocument.URI = e.sandbox.Workdir.URI(path)
+	params.Context.Only = only
+	if diagnostics != nil {
+		params.Context.Diagnostics = diagnostics
+	}
+	if rng != nil {
+		params.Range = *rng
+	}
+	return e.Server.CodeAction(ctx, params)
 }
 
 func (e *Editor) ExecuteCommand(ctx context.Context, params *protocol.ExecuteCommandParams) (interface{}, error) {
@@ -860,7 +1009,7 @@ func (e *Editor) checkBufferPosition(path string, pos Pos) error {
 	if !ok {
 		return fmt.Errorf("buffer %q is not open", path)
 	}
-	if !inText(pos, buf.content) {
+	if !inText(pos, buf.lines) {
 		return fmt.Errorf("position %v is invalid in buffer %q", pos, path)
 	}
 	return nil
@@ -870,18 +1019,22 @@ func (e *Editor) checkBufferPosition(path string, pos Pos) error {
 // path. It does not report any resulting file changes as a watched file
 // change, so must be followed by a call to Workdir.CheckForFileChanges once
 // the generate command has completed.
+// TODO(rFindley): this shouldn't be necessary anymore. Delete it.
 func (e *Editor) RunGenerate(ctx context.Context, dir string) error {
 	if e.Server == nil {
 		return nil
 	}
 	absDir := e.sandbox.Workdir.AbsPath(dir)
-	jsonArgs, err := source.MarshalArgs(span.URIFromPath(absDir), false)
+	cmd, err := command.NewGenerateCommand("", command.GenerateArgs{
+		Dir:       protocol.URIFromSpanURI(span.URIFromPath(absDir)),
+		Recursive: false,
+	})
 	if err != nil {
 		return err
 	}
 	params := &protocol.ExecuteCommandParams{
-		Command:   source.CommandGenerate.ID(),
-		Arguments: jsonArgs,
+		Command:   cmd.Command,
+		Arguments: cmd.Arguments,
 	}
 	if _, err := e.ExecuteCommand(ctx, params); err != nil {
 		return fmt.Errorf("running generate: %v", err)
@@ -955,6 +1108,16 @@ func (e *Editor) AcceptCompletion(ctx context.Context, path string, pos Pos, ite
 	}, item.AdditionalTextEdits...)))
 }
 
+// Symbols executes a workspace/symbols request on the server.
+func (e *Editor) Symbols(ctx context.Context, sym string) ([]protocol.SymbolInformation, error) {
+	if e.Server == nil {
+		return nil, nil
+	}
+	params := &protocol.WorkspaceSymbolParams{Query: sym}
+	ans, err := e.Server.Symbol(ctx, params)
+	return ans, err
+}
+
 // References executes a reference request on the server.
 func (e *Editor) References(ctx context.Context, path string, pos Pos) ([]protocol.Location, error) {
 	if e.Server == nil {
@@ -982,8 +1145,51 @@ func (e *Editor) References(ctx context.Context, path string, pos Pos) ([]protoc
 	return locations, nil
 }
 
+func (e *Editor) Rename(ctx context.Context, path string, pos Pos, newName string) error {
+	if e.Server == nil {
+		return nil
+	}
+	params := &protocol.RenameParams{
+		TextDocument: e.textDocumentIdentifier(path),
+		Position:     pos.ToProtocolPosition(),
+		NewName:      newName,
+	}
+	wsEdits, err := e.Server.Rename(ctx, params)
+	if err != nil {
+		return err
+	}
+	for _, change := range wsEdits.DocumentChanges {
+		if err := e.applyProtocolEdit(ctx, change); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Editor) applyProtocolEdit(ctx context.Context, change protocol.TextDocumentEdit) error {
+	path := e.sandbox.Workdir.URIToPath(change.TextDocument.URI)
+	if ver := int32(e.BufferVersion(path)); ver != change.TextDocument.Version {
+		return fmt.Errorf("buffer versions for %q do not match: have %d, editing %d", path, ver, change.TextDocument.Version)
+	}
+	if !e.HasBuffer(path) {
+		err := e.OpenFile(ctx, path)
+		if os.IsNotExist(err) {
+			// TODO: it's unclear if this is correct. Here we create the buffer (with
+			// version 1), then apply edits. Perhaps we should apply the edits before
+			// sending the didOpen notification.
+			e.CreateBuffer(ctx, path, "")
+			err = nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+	fakeEdits := convertEdits(change.Edits)
+	return e.EditBuffer(ctx, path, fakeEdits)
+}
+
 // CodeAction executes a codeAction request on the server.
-func (e *Editor) CodeAction(ctx context.Context, path string, rng *protocol.Range) ([]protocol.CodeAction, error) {
+func (e *Editor) CodeAction(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic) ([]protocol.CodeAction, error) {
 	if e.Server == nil {
 		return nil, nil
 	}
@@ -995,6 +1201,9 @@ func (e *Editor) CodeAction(ctx context.Context, path string, rng *protocol.Rang
 	}
 	params := &protocol.CodeActionParams{
 		TextDocument: e.textDocumentIdentifier(path),
+		Context: protocol.CodeActionContext{
+			Diagnostics: diagnostics,
+		},
 	}
 	if rng != nil {
 		params.Range = *rng
@@ -1032,4 +1241,18 @@ func (e *Editor) DocumentLink(ctx context.Context, path string) ([]protocol.Docu
 	params := &protocol.DocumentLinkParams{}
 	params.TextDocument.URI = e.sandbox.Workdir.URI(path)
 	return e.Server.DocumentLink(ctx, params)
+}
+
+func (e *Editor) DocumentHighlight(ctx context.Context, path string, pos Pos) ([]protocol.DocumentHighlight, error) {
+	if e.Server == nil {
+		return nil, nil
+	}
+	if err := e.checkBufferPosition(path, pos); err != nil {
+		return nil, err
+	}
+	params := &protocol.DocumentHighlightParams{}
+	params.TextDocument.URI = e.sandbox.Workdir.URI(path)
+	params.Position = pos.ToProtocolPosition()
+
+	return e.Server.DocumentHighlight(ctx, params)
 }

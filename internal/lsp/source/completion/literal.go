@@ -7,14 +7,11 @@ package completion
 import (
 	"context"
 	"fmt"
-	"go/ast"
-	"go/token"
 	"go/types"
 	"strings"
 	"unicode"
 
 	"golang.org/x/tools/internal/event"
-	"golang.org/x/tools/internal/lsp/diff"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/snippet"
 	"golang.org/x/tools/internal/lsp/source"
@@ -70,7 +67,7 @@ func (c *completer) literal(ctx context.Context, literalType types.Type, imp *im
 		cand.addressable = true
 	}
 
-	if !c.matchingCandidate(&cand) {
+	if !c.matchingCandidate(&cand) || cand.convertTo != nil {
 		return
 	}
 
@@ -106,12 +103,12 @@ func (c *completer) literal(ctx context.Context, literalType types.Type, imp *im
 
 	// If prefix matches the type name, client may want a composite literal.
 	if score := c.matcher.Score(matchName); score > 0 {
-		if cand.takeAddress {
+		if cand.hasMod(reference) {
 			if sel != nil {
 				// If we are in a selector we must place the "&" before the selector.
 				// For example, "foo.B<>" must complete to "&foo.Bar{}", not
 				// "foo.&Bar{}".
-				edits, err := prependEdit(c.snapshot.FileSet(), c.mapper, sel, "&")
+				edits, err := c.editText(sel.Pos(), sel.Pos(), "&")
 				if err != nil {
 					event.Error(ctx, "error making edit for literal pointer completion", err)
 					return
@@ -147,7 +144,7 @@ func (c *completer) literal(ctx context.Context, literalType types.Type, imp *im
 	// If prefix matches "make", client may want a "make()"
 	// invocation. We also include the type name to allow for more
 	// flexible fuzzy matching.
-	if score := c.matcher.Score("make." + matchName); !cand.takeAddress && score > 0 {
+	if score := c.matcher.Score("make." + matchName); !cand.hasMod(reference) && score > 0 {
 		switch literalType.Underlying().(type) {
 		case *types.Slice:
 			// The second argument to "make()" for slices is required, so default to "0".
@@ -160,26 +157,12 @@ func (c *completer) literal(ctx context.Context, literalType types.Type, imp *im
 	}
 
 	// If prefix matches "func", client may want a function literal.
-	if score := c.matcher.Score("func"); !cand.takeAddress && score > 0 && !source.IsInterface(expType) {
+	if score := c.matcher.Score("func"); !cand.hasMod(reference) && score > 0 && !source.IsInterface(expType) {
 		switch t := literalType.Underlying().(type) {
 		case *types.Signature:
 			c.functionLiteral(ctx, t, float64(score))
 		}
 	}
-}
-
-// prependEdit produces text edits that preprend the specified prefix
-// to the specified node.
-func prependEdit(fset *token.FileSet, m *protocol.ColumnMapper, node ast.Node, prefix string) ([]protocol.TextEdit, error) {
-	rng := source.NewMappedRange(fset, m, node.Pos(), node.Pos())
-	spn, err := rng.Span()
-	if err != nil {
-		return nil, err
-	}
-	return source.ToProtocolEdits(m, []diff.TextEdit{{
-		Span:    spn,
-		NewText: prefix,
-	}})
 }
 
 // literalCandidateScore is the base score for literal candidates.
@@ -311,6 +294,15 @@ func (c *completer) functionLiteral(ctx context.Context, sig *types.Signature, m
 	})
 }
 
+// conventionalAcronyms contains conventional acronyms for type names
+// in lower case. For example, "ctx" for "context" and "err" for "error".
+var conventionalAcronyms = map[string]string{
+	"context":        "ctx",
+	"error":          "err",
+	"tx":             "tx",
+	"responsewriter": "w",
+}
+
 // abbreviateTypeName abbreviates type names into acronyms. For
 // example, "fooBar" is abbreviated "fb". Care is taken to ignore
 // non-identifier runes. For example, "[]int" becomes "i", and
@@ -336,6 +328,10 @@ func abbreviateTypeName(s string) string {
 
 		return !unicode.IsLetter(r)
 	})
+
+	if acr, ok := conventionalAcronyms[strings.ToLower(s)]; ok {
+		return acr
+	}
 
 	for i, r := range s {
 		// Stop if we encounter a non-identifier rune.
@@ -386,6 +382,11 @@ func (c *completer) compositeLiteral(T types.Type, typeName string, matchScore f
 // basicLiteral adds a literal completion item for the given basic
 // type name typeName.
 func (c *completer) basicLiteral(T types.Type, typeName string, matchScore float64, edits []protocol.TextEdit) {
+	// Never give type conversions like "untyped int()".
+	if isUntyped(T) {
+		return
+	}
+
 	snip := &snippet.Builder{}
 	snip.WriteText(typeName + "(")
 	snip.WriteFinalTabstop()

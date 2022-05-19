@@ -7,6 +7,7 @@ package source
 import (
 	"context"
 	"fmt"
+	"io"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -31,6 +32,7 @@ import (
 	"golang.org/x/tools/go/analysis/passes/loopclosure"
 	"golang.org/x/tools/go/analysis/passes/lostcancel"
 	"golang.org/x/tools/go/analysis/passes/nilfunc"
+	"golang.org/x/tools/go/analysis/passes/nilness"
 	"golang.org/x/tools/go/analysis/passes/printf"
 	"golang.org/x/tools/go/analysis/passes/shadow"
 	"golang.org/x/tools/go/analysis/passes/shift"
@@ -44,15 +46,20 @@ import (
 	"golang.org/x/tools/go/analysis/passes/unreachable"
 	"golang.org/x/tools/go/analysis/passes/unsafeptr"
 	"golang.org/x/tools/go/analysis/passes/unusedresult"
+	"golang.org/x/tools/go/analysis/passes/unusedwrite"
 	"golang.org/x/tools/internal/lsp/analysis/fillreturns"
 	"golang.org/x/tools/internal/lsp/analysis/fillstruct"
+	"golang.org/x/tools/internal/lsp/analysis/infertypeargs"
 	"golang.org/x/tools/internal/lsp/analysis/nonewvars"
 	"golang.org/x/tools/internal/lsp/analysis/noresultvalues"
 	"golang.org/x/tools/internal/lsp/analysis/simplifycompositelit"
 	"golang.org/x/tools/internal/lsp/analysis/simplifyrange"
 	"golang.org/x/tools/internal/lsp/analysis/simplifyslice"
+	"golang.org/x/tools/internal/lsp/analysis/stubmethods"
 	"golang.org/x/tools/internal/lsp/analysis/undeclaredname"
 	"golang.org/x/tools/internal/lsp/analysis/unusedparams"
+	"golang.org/x/tools/internal/lsp/analysis/useany"
+	"golang.org/x/tools/internal/lsp/command"
 	"golang.org/x/tools/internal/lsp/diff"
 	"golang.org/x/tools/internal/lsp/diff/myers"
 	"golang.org/x/tools/internal/lsp/protocol"
@@ -66,22 +73,23 @@ var (
 
 // DefaultOptions is the options that are used for Gopls execution independent
 // of any externally provided configuration (LSP initialization, command
-// invokation, etc.).
+// invocation, etc.).
 func DefaultOptions() *Options {
 	optionsOnce.Do(func() {
 		var commands []string
-		for _, c := range Commands {
+		for _, c := range command.Commands {
 			commands = append(commands, c.ID())
 		}
 		defaultOptions = &Options{
 			ClientOptions: ClientOptions{
-				InsertTextFormat:                  protocol.PlainTextTextFormat,
-				PreferredContentFormat:            protocol.Markdown,
-				ConfigurationSupported:            true,
-				DynamicConfigurationSupported:     true,
-				DynamicWatchedFilesSupported:      true,
-				LineFoldingOnly:                   false,
-				HierarchicalDocumentSymbolSupport: true,
+				InsertTextFormat:                           protocol.PlainTextTextFormat,
+				PreferredContentFormat:                     protocol.Markdown,
+				ConfigurationSupported:                     true,
+				DynamicConfigurationSupported:              true,
+				DynamicRegistrationSemanticTokensSupported: true,
+				DynamicWatchedFilesSupported:               true,
+				LineFoldingOnly:                            false,
+				HierarchicalDocumentSymbolSupport:          true,
 			},
 			ServerOptions: ServerOptions{
 				SupportedCodeActions: map[FileKind]map[protocol.CodeActionKind]bool{
@@ -94,8 +102,11 @@ func DefaultOptions() *Options {
 					},
 					Mod: {
 						protocol.SourceOrganizeImports: true,
+						protocol.QuickFix:              true,
 					},
-					Sum: {},
+					Work: {},
+					Sum:  {},
+					Tmpl: {},
 				},
 				SupportedCommands: commands,
 			},
@@ -103,10 +114,13 @@ func DefaultOptions() *Options {
 				BuildOptions: BuildOptions{
 					ExpandWorkspaceToModule:     true,
 					ExperimentalPackageCacheKey: true,
+					MemoryMode:                  ModeNormal,
+					DirectoryFilters:            []string{"-node_modules"},
+					TemplateExtensions:          []string{},
 				},
 				UIOptions: UIOptions{
 					DiagnosticOptions: DiagnosticOptions{
-						ExperimentalDiagnosticsDelay: 250 * time.Millisecond,
+						DiagnosticsDelay: 250 * time.Millisecond,
 						Annotations: map[Annotation]bool{
 							Bounds: true,
 							Escape: true,
@@ -121,20 +135,21 @@ func DefaultOptions() *Options {
 					},
 					NavigationOptions: NavigationOptions{
 						ImportShortcut: Both,
-						SymbolMatcher:  SymbolFuzzy,
+						SymbolMatcher:  SymbolFastFuzzy,
 						SymbolStyle:    DynamicSymbols,
 					},
 					CompletionOptions: CompletionOptions{
-						Matcher:          Fuzzy,
-						CompletionBudget: 100 * time.Millisecond,
+						Matcher:                        Fuzzy,
+						CompletionBudget:               100 * time.Millisecond,
+						ExperimentalPostfixCompletions: true,
 					},
 					Codelenses: map[string]bool{
-						CommandGenerate.Name:          true,
-						CommandRegenerateCgo.Name:     true,
-						CommandTidy.Name:              true,
-						CommandToggleDetails.Name:     false,
-						CommandUpgradeDependency.Name: true,
-						CommandVendor.Name:            true,
+						string(command.Generate):          true,
+						string(command.RegenerateCgo):     true,
+						string(command.Tidy):              true,
+						string(command.GCDetails):         false,
+						string(command.UpgradeDependency): true,
+						string(command.Vendor):            true,
 					},
 				},
 			},
@@ -151,7 +166,7 @@ func DefaultOptions() *Options {
 				DefaultAnalyzers:     defaultAnalyzers(),
 				TypeErrorAnalyzers:   typeErrorAnalyzers(),
 				ConvenienceAnalyzers: convenienceAnalyzers(),
-				StaticcheckAnalyzers: map[string]Analyzer{},
+				StaticcheckAnalyzers: map[string]*Analyzer{},
 				GoDiff:               true,
 			},
 		}
@@ -172,15 +187,19 @@ type Options struct {
 // ClientOptions holds LSP-specific configuration that is provided by the
 // client.
 type ClientOptions struct {
-	InsertTextFormat                  protocol.InsertTextFormat
-	ConfigurationSupported            bool
-	DynamicConfigurationSupported     bool
-	DynamicWatchedFilesSupported      bool
-	PreferredContentFormat            protocol.MarkupKind
-	LineFoldingOnly                   bool
-	HierarchicalDocumentSymbolSupport bool
-	SemanticTypes                     []string
-	SemanticMods                      []string
+	InsertTextFormat                           protocol.InsertTextFormat
+	ConfigurationSupported                     bool
+	DynamicConfigurationSupported              bool
+	DynamicRegistrationSemanticTokensSupported bool
+	DynamicWatchedFilesSupported               bool
+	PreferredContentFormat                     protocol.MarkupKind
+	LineFoldingOnly                            bool
+	HierarchicalDocumentSymbolSupport          bool
+	SemanticTypes                              []string
+	SemanticMods                               []string
+	RelatedInformationSupported                bool
+	CompletionTags                             bool
+	CompletionDeprecated                       bool
 }
 
 // ServerOptions holds LSP-specific configuration that is provided by the
@@ -207,10 +226,24 @@ type BuildOptions struct {
 	// The path prefix can be empty, so an initial `-` excludes everything.
 	//
 	// Examples:
+	//
 	// Exclude node_modules: `-node_modules`
+	//
 	// Include only project_a: `-` (exclude everything), `+project_a`
+	//
 	// Include only project_a, but not node_modules inside it: `-`, `+project_a`, `-project_a/node_modules`
 	DirectoryFilters []string
+
+	// TemplateExtensions gives the extensions of file names that are treateed
+	// as template files. (The extension
+	// is the part of the file name after the final dot.)
+	TemplateExtensions []string
+
+	// MemoryMode controls the tradeoff `gopls` makes between memory usage and
+	// correctness.
+	//
+	// Values other than `Normal` are untested and may break in surprising ways.
+	MemoryMode MemoryMode `status:"experimental"`
 
 	// ExpandWorkspaceToModule instructs `gopls` to adjust the scope of the
 	// workspace to find the best available module root. `gopls` first looks for
@@ -241,6 +274,12 @@ type BuildOptions struct {
 	// downloads rather than requiring user action. This option will eventually
 	// be removed.
 	AllowImplicitNetworkAccess bool `status:"experimental"`
+
+	// ExperimentalUseInvalidMetadata enables gopls to fall back on outdated
+	// package metadata to provide editor features if the go command fails to
+	// load packages for some reason (like an invalid go.mod file). This will
+	// eventually be the default behavior, and this setting will be removed.
+	ExperimentalUseInvalidMetadata bool `status:"experimental"`
 }
 
 type UIOptions struct {
@@ -259,7 +298,7 @@ type UIOptions struct {
 	// ```json5
 	// "gopls": {
 	// ...
-	//   "codelens": {
+	//   "codelenses": {
 	//     "generate": false,  // Don't show the `go generate` lens.
 	//     "gc_details": true  // Show a code lens toggling the display of gc's choices.
 	//   }
@@ -288,6 +327,10 @@ type CompletionOptions struct {
 	// Matcher sets the algorithm that is used when calculating completion
 	// candidates.
 	Matcher Matcher `status:"advanced"`
+
+	// ExperimentalPostfixCompletions enables artifical method snippets
+	// such as "someSlice.sort!".
+	ExperimentalPostfixCompletions bool `status:"experimental"`
 }
 
 type DocumentationOptions struct {
@@ -344,13 +387,22 @@ type DiagnosticOptions struct {
 	// that should be reported by the gc_details command.
 	Annotations map[Annotation]bool `status:"experimental"`
 
-	// ExperimentalDiagnosticsDelay controls the amount of time that gopls waits
+	// DiagnosticsDelay controls the amount of time that gopls waits
 	// after the most recent file modification before computing deep diagnostics.
 	// Simple diagnostics (parsing and type-checking) are always run immediately
 	// on recently modified packages.
 	//
 	// This option must be set to a valid duration string, for example `"250ms"`.
-	ExperimentalDiagnosticsDelay time.Duration `status:"experimental"`
+	DiagnosticsDelay time.Duration `status:"advanced"`
+
+	// ExperimentalWatchedFileDelay controls the amount of time that gopls waits
+	// for additional workspace/didChangeWatchedFiles notifications to arrive,
+	// before processing all such notifications in a single batch. This is
+	// intended for use by LSP clients that don't support their own batching of
+	// file system notifications.
+	//
+	// This option must be set to a valid duration string, for example `"100ms"`.
+	ExperimentalWatchedFileDelay time.Duration `status:"experimental"`
 }
 
 type NavigationOptions struct {
@@ -368,7 +420,7 @@ type NavigationOptions struct {
 	// ```json5
 	// "gopls": {
 	// ...
-	//   "symbolStyle": "dynamic",
+	//   "symbolStyle": "Dynamic",
 	// ...
 	// }
 	// ```
@@ -410,15 +462,20 @@ func (u *UserOptions) SetEnvSlice(env []string) {
 // Hooks contains configuration that is provided to the Gopls command by the
 // main package.
 type Hooks struct {
-	LicensesText         string
-	GoDiff               bool
-	ComputeEdits         diff.ComputeEdits
-	URLRegexp            *regexp.Regexp
-	GofumptFormat        func(ctx context.Context, src []byte) ([]byte, error)
-	DefaultAnalyzers     map[string]Analyzer
-	TypeErrorAnalyzers   map[string]Analyzer
-	ConvenienceAnalyzers map[string]Analyzer
-	StaticcheckAnalyzers map[string]Analyzer
+	LicensesText string
+	GoDiff       bool
+	ComputeEdits diff.ComputeEdits
+	URLRegexp    *regexp.Regexp
+
+	// GofumptFormat allows the gopls module to wire-in a call to
+	// gofumpt/format.Source. langVersion and modulePath are used for some
+	// Gofumpt formatting rules -- see the Gofumpt documentation for details.
+	GofumptFormat func(ctx context.Context, langVersion, modulePath string, src []byte) ([]byte, error)
+
+	DefaultAnalyzers     map[string]*Analyzer
+	TypeErrorAnalyzers   map[string]*Analyzer
+	ConvenienceAnalyzers map[string]*Analyzer
+	StaticcheckAnalyzers map[string]*Analyzer
 }
 
 // InternalOptions contains settings that are not intended for use by the
@@ -501,6 +558,7 @@ type SymbolMatcher string
 
 const (
 	SymbolFuzzy           SymbolMatcher = "Fuzzy"
+	SymbolFastFuzzy       SymbolMatcher = "FastFuzzy"
 	SymbolCaseInsensitive SymbolMatcher = "CaseInsensitive"
 	SymbolCaseSensitive   SymbolMatcher = "CaseSensitive"
 )
@@ -537,6 +595,16 @@ const (
 	Structured HoverKind = "Structured"
 )
 
+type MemoryMode string
+
+const (
+	ModeNormal MemoryMode = "Normal"
+	// In DegradeClosed mode, `gopls` will collect less information about
+	// packages without open files. As a result, features like Find
+	// References and Rename will miss results in such packages.
+	ModeDegradeClosed MemoryMode = "DegradeClosed"
+)
+
 type OptionResults []OptionResult
 
 type OptionResult struct {
@@ -569,7 +637,7 @@ func SetOptions(options *Options, opts interface{}) OptionResults {
 		for name, value := range opts {
 			if b, ok := value.(bool); name == "allExperiments" && ok && b {
 				enableExperiments = true
-				options.enableAllExperiments()
+				options.EnableAllExperiments()
 			}
 		}
 		seen := map[string]struct{}{}
@@ -598,6 +666,7 @@ func (o *Options) ForClientCapabilities(caps protocol.ClientCapabilities) {
 	// Check if the client supports configuration messages.
 	o.ConfigurationSupported = caps.Workspace.Configuration
 	o.DynamicConfigurationSupported = caps.Workspace.DidChangeConfiguration.DynamicRegistration
+	o.DynamicRegistrationSemanticTokensSupported = caps.TextDocument.SemanticTokens.DynamicRegistration
 	o.DynamicWatchedFilesSupported = caps.Workspace.DidChangeWatchedFiles.DynamicRegistration
 
 	// Check which types of content format are supported by this client.
@@ -614,6 +683,15 @@ func (o *Options) ForClientCapabilities(caps protocol.ClientCapabilities) {
 	o.SemanticMods = caps.TextDocument.SemanticTokens.TokenModifiers
 	// we don't need Requests, as we support full functionality
 	// we don't need Formats, as there is only one, for now
+
+	// Check if the client supports diagnostic related information.
+	o.RelatedInformationSupported = caps.TextDocument.PublishDiagnostics.RelatedInformation
+	// Check if the client completion support incliudes tags (preferred) or deprecation
+	if caps.TextDocument.Completion.CompletionItem.TagSupport.ValueSet != nil {
+		o.CompletionTags = true
+	} else if caps.TextDocument.Completion.CompletionItem.DeprecatedSupport {
+		o.CompletionDeprecated = true
+	}
 }
 
 func (o *Options) Clone() *Options {
@@ -621,8 +699,8 @@ func (o *Options) Clone() *Options {
 		ClientOptions:   o.ClientOptions,
 		InternalOptions: o.InternalOptions,
 		Hooks: Hooks{
-			GoDiff:        o.Hooks.GoDiff,
-			ComputeEdits:  o.Hooks.ComputeEdits,
+			GoDiff:        o.GoDiff,
+			ComputeEdits:  o.ComputeEdits,
 			GofumptFormat: o.GofumptFormat,
 			URLRegexp:     o.URLRegexp,
 		},
@@ -650,8 +728,8 @@ func (o *Options) Clone() *Options {
 	result.BuildFlags = copySlice(o.BuildFlags)
 	result.DirectoryFilters = copySlice(o.DirectoryFilters)
 
-	copyAnalyzerMap := func(src map[string]Analyzer) map[string]Analyzer {
-		dst := make(map[string]Analyzer)
+	copyAnalyzerMap := func(src map[string]*Analyzer) map[string]*Analyzer {
+		dst := make(map[string]*Analyzer)
 		for k, v := range src {
 			dst[k] = v
 		}
@@ -664,20 +742,28 @@ func (o *Options) Clone() *Options {
 	return result
 }
 
-func (o *Options) AddStaticcheckAnalyzer(a *analysis.Analyzer) {
-	o.StaticcheckAnalyzers[a.Name] = Analyzer{Analyzer: a, Enabled: true}
+func (o *Options) AddStaticcheckAnalyzer(a *analysis.Analyzer, enabled bool, severity protocol.DiagnosticSeverity) {
+	o.StaticcheckAnalyzers[a.Name] = &Analyzer{
+		Analyzer: a,
+		Enabled:  enabled,
+		Severity: severity,
+	}
 }
 
-// enableAllExperiments turns on all of the experimental "off-by-default"
+// EnableAllExperiments turns on all of the experimental "off-by-default"
 // features offered by gopls. Any experimental features specified in maps
 // should be enabled in enableAllExperimentMaps.
-func (o *Options) enableAllExperiments() {
-	// There are currently no experimental features in development.
+func (o *Options) EnableAllExperiments() {
+	o.SemanticTokens = true
+	o.ExperimentalPostfixCompletions = true
+	o.ExperimentalUseInvalidMetadata = true
+	o.ExperimentalWatchedFileDelay = 50 * time.Millisecond
+	o.SymbolMatcher = SymbolFastFuzzy
 }
 
 func (o *Options) enableAllExperimentMaps() {
-	if _, ok := o.Codelenses[CommandToggleDetails.Name]; !ok {
-		o.Codelenses[CommandToggleDetails.Name] = true
+	if _, ok := o.Codelenses[string(command.GCDetails)]; !ok {
+		o.Codelenses[string(command.GCDetails)] = true
 	}
 	if _, ok := o.Analyses[unusedparams.Analyzer.Name]; !ok {
 		o.Analyses[unusedparams.Analyzer.Name] = true
@@ -733,9 +819,16 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 				result.errorf("invalid filter %q, must start with + or -", filter)
 				return result
 			}
-			filters = append(filters, filepath.FromSlash(filter))
+			filters = append(filters, strings.TrimRight(filepath.FromSlash(filter), "/"))
 		}
 		o.DirectoryFilters = filters
+	case "memoryMode":
+		if s, ok := result.asOneOf(
+			string(ModeNormal),
+			string(ModeDegradeClosed),
+		); ok {
+			o.MemoryMode = MemoryMode(s)
+		}
 	case "completionDocumentation":
 		result.setBool(&o.CompletionDocumentation)
 	case "usePlaceholders":
@@ -758,6 +851,7 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 	case "symbolMatcher":
 		if s, ok := result.asOneOf(
 			string(SymbolFuzzy),
+			string(SymbolFastFuzzy),
 			string(SymbolCaseInsensitive),
 			string(SymbolCaseSensitive),
 		); ok {
@@ -844,11 +938,38 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 	case "expandWorkspaceToModule":
 		result.setBool(&o.ExpandWorkspaceToModule)
 
+	case "experimentalPostfixCompletions":
+		result.setBool(&o.ExperimentalPostfixCompletions)
+
 	case "experimentalWorkspaceModule":
 		result.setBool(&o.ExperimentalWorkspaceModule)
 
-	case "experimentalDiagnosticsDelay":
-		result.setDuration(&o.ExperimentalDiagnosticsDelay)
+	case "experimentalTemplateSupport": // remove after June 2022
+		result.State = OptionDeprecated
+
+	case "templateExtensions":
+		if iexts, ok := value.([]interface{}); ok {
+			ans := []string{}
+			for _, x := range iexts {
+				ans = append(ans, fmt.Sprint(x))
+			}
+			o.TemplateExtensions = ans
+			break
+		}
+		if value == nil {
+			o.TemplateExtensions = nil
+			break
+		}
+		result.errorf(fmt.Sprintf("unexpected type %T not []string", value))
+	case "experimentalDiagnosticsDelay", "diagnosticsDelay":
+		if name == "experimentalDiagnosticsDelay" {
+			result.State = OptionDeprecated
+			result.Replacement = "diagnosticsDelay"
+		}
+		result.setDuration(&o.DiagnosticsDelay)
+
+	case "experimentalWatchedFileDelay":
+		result.setDuration(&o.ExperimentalWatchedFileDelay)
 
 	case "experimentalPackageCacheKey":
 		result.setBool(&o.ExperimentalPackageCacheKey)
@@ -858,6 +979,9 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 
 	case "allowImplicitNetworkAccess":
 		result.setBool(&o.AllowImplicitNetworkAccess)
+
+	case "experimentalUseInvalidMetadata":
+		result.setBool(&o.ExperimentalUseInvalidMetadata)
 
 	case "allExperiments":
 		// This setting should be handled before all of the other options are
@@ -1044,7 +1168,7 @@ func (r *OptionResult) setString(s *string) {
 
 // EnabledAnalyzers returns all of the analyzers enabled for the given
 // snapshot.
-func EnabledAnalyzers(snapshot Snapshot) (analyzers []Analyzer) {
+func EnabledAnalyzers(snapshot Snapshot) (analyzers []*Analyzer) {
 	for _, a := range snapshot.View().Options().DefaultAnalyzers {
 		if a.IsEnabled(snapshot.View()) {
 			analyzers = append(analyzers, a)
@@ -1068,45 +1192,48 @@ func EnabledAnalyzers(snapshot Snapshot) (analyzers []Analyzer) {
 	return analyzers
 }
 
-func typeErrorAnalyzers() map[string]Analyzer {
-	return map[string]Analyzer{
+func typeErrorAnalyzers() map[string]*Analyzer {
+	return map[string]*Analyzer{
 		fillreturns.Analyzer.Name: {
-			Analyzer:       fillreturns.Analyzer,
-			FixesError:     fillreturns.FixesError,
-			HighConfidence: true,
-			Enabled:        true,
+			Analyzer:   fillreturns.Analyzer,
+			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
+			Enabled:    true,
 		},
 		nonewvars.Analyzer.Name: {
-			Analyzer:   nonewvars.Analyzer,
-			FixesError: nonewvars.FixesError,
-			Enabled:    true,
+			Analyzer: nonewvars.Analyzer,
+			Enabled:  true,
 		},
 		noresultvalues.Analyzer.Name: {
-			Analyzer:   noresultvalues.Analyzer,
-			FixesError: noresultvalues.FixesError,
-			Enabled:    true,
+			Analyzer: noresultvalues.Analyzer,
+			Enabled:  true,
 		},
 		undeclaredname.Analyzer.Name: {
-			Analyzer:   undeclaredname.Analyzer,
-			FixesError: undeclaredname.FixesError,
-			Command:    CommandUndeclaredName,
-			Enabled:    true,
-		},
-	}
-}
-
-func convenienceAnalyzers() map[string]Analyzer {
-	return map[string]Analyzer{
-		fillstruct.Analyzer.Name: {
-			Analyzer: fillstruct.Analyzer,
-			Command:  CommandFillStruct,
+			Analyzer: undeclaredname.Analyzer,
+			Fix:      UndeclaredName,
 			Enabled:  true,
 		},
 	}
 }
 
-func defaultAnalyzers() map[string]Analyzer {
-	return map[string]Analyzer{
+func convenienceAnalyzers() map[string]*Analyzer {
+	return map[string]*Analyzer{
+		fillstruct.Analyzer.Name: {
+			Analyzer:   fillstruct.Analyzer,
+			Fix:        FillStruct,
+			Enabled:    true,
+			ActionKind: []protocol.CodeActionKind{protocol.RefactorRewrite},
+		},
+		stubmethods.Analyzer.Name: {
+			Analyzer:   stubmethods.Analyzer,
+			ActionKind: []protocol.CodeActionKind{protocol.RefactorRewrite},
+			Fix:        StubMethods,
+			Enabled:    true,
+		},
+	}
+}
+
+func defaultAnalyzers() map[string]*Analyzer {
+	return map[string]*Analyzer{
 		// The traditional vet suite:
 		asmdecl.Analyzer.Name:       {Analyzer: asmdecl.Analyzer, Enabled: true},
 		assign.Analyzer.Name:        {Analyzer: assign.Analyzer, Enabled: true},
@@ -1137,15 +1264,31 @@ func defaultAnalyzers() map[string]Analyzer {
 		atomicalign.Analyzer.Name:      {Analyzer: atomicalign.Analyzer, Enabled: true},
 		deepequalerrors.Analyzer.Name:  {Analyzer: deepequalerrors.Analyzer, Enabled: true},
 		fieldalignment.Analyzer.Name:   {Analyzer: fieldalignment.Analyzer, Enabled: false},
+		nilness.Analyzer.Name:          {Analyzer: nilness.Analyzer, Enabled: false},
 		shadow.Analyzer.Name:           {Analyzer: shadow.Analyzer, Enabled: false},
 		sortslice.Analyzer.Name:        {Analyzer: sortslice.Analyzer, Enabled: true},
 		testinggoroutine.Analyzer.Name: {Analyzer: testinggoroutine.Analyzer, Enabled: true},
 		unusedparams.Analyzer.Name:     {Analyzer: unusedparams.Analyzer, Enabled: false},
+		unusedwrite.Analyzer.Name:      {Analyzer: unusedwrite.Analyzer, Enabled: false},
+		useany.Analyzer.Name:           {Analyzer: useany.Analyzer, Enabled: false},
+		infertypeargs.Analyzer.Name:    {Analyzer: infertypeargs.Analyzer, Enabled: true},
 
 		// gofmt -s suite:
-		simplifycompositelit.Analyzer.Name: {Analyzer: simplifycompositelit.Analyzer, Enabled: true, HighConfidence: true},
-		simplifyrange.Analyzer.Name:        {Analyzer: simplifyrange.Analyzer, Enabled: true, HighConfidence: true},
-		simplifyslice.Analyzer.Name:        {Analyzer: simplifyslice.Analyzer, Enabled: true, HighConfidence: true},
+		simplifycompositelit.Analyzer.Name: {
+			Analyzer:   simplifycompositelit.Analyzer,
+			Enabled:    true,
+			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
+		},
+		simplifyrange.Analyzer.Name: {
+			Analyzer:   simplifyrange.Analyzer,
+			Enabled:    true,
+			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
+		},
+		simplifyslice.Analyzer.Name: {
+			Analyzer:   simplifyslice.Analyzer,
+			Enabled:    true,
+			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
+		},
 	}
 }
 
@@ -1174,6 +1317,66 @@ type OptionJSON struct {
 	Hierarchy  string
 }
 
+func (o *OptionJSON) String() string {
+	return o.Name
+}
+
+func (o *OptionJSON) Write(w io.Writer) {
+	fmt.Fprintf(w, "**%v** *%v*\n\n", o.Name, o.Type)
+	writeStatus(w, o.Status)
+	enumValues := collectEnums(o)
+	fmt.Fprintf(w, "%v%v\nDefault: `%v`.\n\n", o.Doc, enumValues, o.Default)
+}
+
+func writeStatus(section io.Writer, status string) {
+	switch status {
+	case "":
+	case "advanced":
+		fmt.Fprint(section, "**This is an advanced setting and should not be configured by most `gopls` users.**\n\n")
+	case "debug":
+		fmt.Fprint(section, "**This setting is for debugging purposes only.**\n\n")
+	case "experimental":
+		fmt.Fprint(section, "**This setting is experimental and may be deleted.**\n\n")
+	default:
+		fmt.Fprintf(section, "**Status: %s.**\n\n", status)
+	}
+}
+
+var parBreakRE = regexp.MustCompile("\n{2,}")
+
+func collectEnums(opt *OptionJSON) string {
+	var b strings.Builder
+	write := func(name, doc string, index, len int) {
+		if doc != "" {
+			unbroken := parBreakRE.ReplaceAllString(doc, "\\\n")
+			fmt.Fprintf(&b, "* %s\n", strings.TrimSpace(unbroken))
+		} else {
+			fmt.Fprintf(&b, "* `%s`\n", name)
+		}
+	}
+	if len(opt.EnumValues) > 0 && opt.Type == "enum" {
+		b.WriteString("\nMust be one of:\n\n")
+		for i, val := range opt.EnumValues {
+			write(val.Value, val.Doc, i, len(opt.EnumValues))
+		}
+	} else if len(opt.EnumKeys.Keys) > 0 && shouldShowEnumKeysInSettings(opt.Name) {
+		b.WriteString("\nCan contain any of:\n\n")
+		for i, val := range opt.EnumKeys.Keys {
+			write(val.Name, val.Doc, i, len(opt.EnumKeys.Keys))
+		}
+	}
+	return b.String()
+}
+
+func shouldShowEnumKeysInSettings(name string) bool {
+	// Both of these fields have too many possible options to print.
+	return !hardcodedEnumKeys(name)
+}
+
+func hardcodedEnumKeys(name string) bool {
+	return name == "analyses" || name == "codelenses"
+}
+
 type EnumKeys struct {
 	ValueType string
 	Keys      []EnumKey
@@ -1191,9 +1394,25 @@ type EnumValue struct {
 }
 
 type CommandJSON struct {
-	Command string
-	Title   string
-	Doc     string
+	Command   string
+	Title     string
+	Doc       string
+	ArgDoc    string
+	ResultDoc string
+}
+
+func (c *CommandJSON) String() string {
+	return c.Command
+}
+
+func (c *CommandJSON) Write(w io.Writer) {
+	fmt.Fprintf(w, "### **%v**\nIdentifier: `%v`\n\n%v\n\n", c.Title, c.Command, c.Doc)
+	if c.ArgDoc != "" {
+		fmt.Fprintf(w, "Args:\n\n```\n%s\n```\n\n", c.ArgDoc)
+	}
+	if c.ResultDoc != "" {
+		fmt.Fprintf(w, "Result:\n\n```\n%s\n```\n\n", c.ResultDoc)
+	}
 }
 
 type LensJSON struct {
@@ -1202,8 +1421,24 @@ type LensJSON struct {
 	Doc   string
 }
 
+func (l *LensJSON) String() string {
+	return l.Title
+}
+
+func (l *LensJSON) Write(w io.Writer) {
+	fmt.Fprintf(w, "%s (%s): %s", l.Title, l.Lens, l.Doc)
+}
+
 type AnalyzerJSON struct {
 	Name    string
 	Doc     string
 	Default bool
+}
+
+func (a *AnalyzerJSON) String() string {
+	return a.Name
+}
+
+func (a *AnalyzerJSON) Write(w io.Writer) {
+	fmt.Fprintf(w, "%s (%s): %v", a.Name, a.Doc, a.Default)
 }

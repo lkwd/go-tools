@@ -45,7 +45,9 @@ type CompletionItem struct {
 	// The insert text does not contain snippets.
 	InsertText string
 
-	Kind protocol.CompletionItemKind
+	Kind       protocol.CompletionItemKind
+	Tags       []protocol.CompletionItemTag
+	Deprecated bool // Deprecated, prefer Tags if available
 
 	// An optional array of additional TextEdits that are applied when
 	// selecting this completion.
@@ -95,6 +97,8 @@ type completionOptions struct {
 	fullDocumentation bool
 	placeholders      bool
 	literal           bool
+	snippets          bool
+	postfix           bool
 	matcher           source.Matcher
 	budget            time.Duration
 }
@@ -361,32 +365,18 @@ type candidate struct {
 	// itself) for a deep candidate.
 	path []types.Object
 
-	// names tracks the names of objects from search root (excluding the
-	// candidate itself) for a deep candidate. This also includes
-	// expanded calls for function invocations.
-	names []string
+	// pathInvokeMask is a bit mask tracking whether each entry in path
+	// should be formatted with "()" (i.e. whether it is a function
+	// invocation).
+	pathInvokeMask uint16
 
-	// expandFuncCall is true if obj should be invoked in the completion.
-	// For example, expandFuncCall=true yields "foo()", expandFuncCall=false yields "foo".
-	expandFuncCall bool
-
-	// takeAddress is true if the completion should take a pointer to obj.
-	// For example, takeAddress=true yields "&foo", takeAddress=false yields "foo".
-	takeAddress bool
+	// mods contains modifications that should be applied to the
+	// candidate when inserted. For example, "foo" may be insterted as
+	// "*foo" or "foo()".
+	mods []typeModKind
 
 	// addressable is true if a pointer can be taken to the candidate.
 	addressable bool
-
-	// makePointer is true if the candidate type name T should be made into *T.
-	makePointer bool
-
-	// dereference is a count of how many times to dereference the candidate obj.
-	// For example, dereference=2 turns "foo" into "**foo" when formatting.
-	dereference int
-
-	// variadic is true if this candidate fills a variadic param and
-	// needs "..." appended.
-	variadic bool
 
 	// convertTo is a type that this candidate should be cast to. For
 	// example, if convertTo is float64, "foo" should be formatted as
@@ -396,6 +386,15 @@ type candidate struct {
 	// imp is the import that needs to be added to this package in order
 	// for this candidate to be valid. nil if no import needed.
 	imp *importInfo
+}
+
+func (c candidate) hasMod(mod typeModKind) bool {
+	for _, m := range c.mods {
+		if m == mod {
+			return true
+		}
+	}
+	return false
 }
 
 // ErrIsDefinition is an error that informs the user they got no
@@ -486,6 +485,13 @@ func Completion(ctx context.Context, snapshot source.Snapshot, fh source.FileHan
 					qual := types.RelativeTo(pkg.GetTypes())
 					objStr = types.ObjectString(obj, qual)
 				}
+				ans, sel := definition(path, obj, snapshot.FileSet(), pgf.Mapper, fh)
+				if ans != nil {
+					sort.Slice(ans, func(i, j int) bool {
+						return ans[i].Score > ans[j].Score
+					})
+					return ans, sel, nil
+				}
 				return nil, nil, ErrIsDefinition{objStr: objStr}
 			}
 		}
@@ -519,6 +525,8 @@ func Completion(ctx context.Context, snapshot source.Snapshot, fh source.FileHan
 			placeholders:      opts.UsePlaceholders,
 			literal:           opts.LiteralCompletions && opts.InsertTextFormat == protocol.SnippetTextFormat,
 			budget:            opts.CompletionBudget,
+			snippets:          opts.InsertTextFormat == protocol.SnippetTextFormat,
+			postfix:           opts.ExperimentalPostfixCompletions,
 		},
 		// default to a matcher that always matches
 		matcher:        prefixMatcher(""),
@@ -554,7 +562,6 @@ func Completion(ctx context.Context, snapshot source.Snapshot, fh source.FileHan
 
 	// Deep search collected candidates and their members for more candidates.
 	c.deepSearch(ctx)
-	c.deepState.searchQueue = nil
 
 	for _, callback := range c.completionCallbacks {
 		if err := c.snapshot.RunProcessEnvFunc(ctx, callback); err != nil {
@@ -1087,10 +1094,9 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 					return err
 				}
 			}
-			candidates := c.packageMembers(pkgName.Imported(), stdScore, nil)
-			for _, cand := range candidates {
+			c.packageMembers(pkgName.Imported(), stdScore, nil, func(cand candidate) {
 				c.deepState.enqueue(cand)
-			}
+			})
 			return nil
 		}
 	}
@@ -1098,10 +1104,12 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 	// Invariant: sel is a true selector.
 	tv, ok := c.pkg.GetTypesInfo().Types[sel.X]
 	if ok {
-		candidates := c.methodsAndFields(tv.Type, tv.Addressable(), nil)
-		for _, cand := range candidates {
+		c.methodsAndFields(tv.Type, tv.Addressable(), nil, func(cand candidate) {
 			c.deepState.enqueue(cand)
-		}
+		})
+
+		c.addPostfixSnippetCandidates(ctx, sel)
+
 		return nil
 	}
 
@@ -1155,10 +1163,9 @@ func (c *completer) unimportedMembers(ctx context.Context, id *ast.Ident) error 
 		if imports.ImportPathToAssumedName(path) != pkg.GetTypes().Name() {
 			imp.name = pkg.GetTypes().Name()
 		}
-		candidates := c.packageMembers(pkg.GetTypes(), unimportedScore(relevances[path]), imp)
-		for _, cand := range candidates {
+		c.packageMembers(pkg.GetTypes(), unimportedScore(relevances[path]), imp, func(cand candidate) {
 			c.deepState.enqueue(cand)
-		}
+		})
 		if len(c.items) >= unimportedMemberTarget {
 			return nil
 		}
@@ -1205,22 +1212,20 @@ func unimportedScore(relevance float64) float64 {
 	return (stdScore + .1*relevance) / 2
 }
 
-func (c *completer) packageMembers(pkg *types.Package, score float64, imp *importInfo) []candidate {
-	var candidates []candidate
+func (c *completer) packageMembers(pkg *types.Package, score float64, imp *importInfo, cb func(candidate)) {
 	scope := pkg.Scope()
 	for _, name := range scope.Names() {
 		obj := scope.Lookup(name)
-		candidates = append(candidates, candidate{
+		cb(candidate{
 			obj:         obj,
 			score:       score,
 			imp:         imp,
 			addressable: isVar(obj),
 		})
 	}
-	return candidates
 }
 
-func (c *completer) methodsAndFields(typ types.Type, addressable bool, imp *importInfo) []candidate {
+func (c *completer) methodsAndFields(typ types.Type, addressable bool, imp *importInfo, cb func(candidate)) {
 	mset := c.methodSetCache[methodSetKey{typ, addressable}]
 	if mset == nil {
 		if addressable && !types.IsInterface(typ) && !isPointer(typ) {
@@ -1233,9 +1238,15 @@ func (c *completer) methodsAndFields(typ types.Type, addressable bool, imp *impo
 		c.methodSetCache[methodSetKey{typ, addressable}] = mset
 	}
 
-	var candidates []candidate
+	if typ.String() == "*testing.F" && addressable {
+		// is that a sufficient test? (or is more care needed?)
+		if c.fuzz(typ, mset, imp, cb, c.snapshot.FileSet()) {
+			return
+		}
+	}
+
 	for i := 0; i < mset.Len(); i++ {
-		candidates = append(candidates, candidate{
+		cb(candidate{
 			obj:         mset.At(i).Obj(),
 			score:       stdScore,
 			imp:         imp,
@@ -1245,15 +1256,13 @@ func (c *completer) methodsAndFields(typ types.Type, addressable bool, imp *impo
 
 	// Add fields of T.
 	eachField(typ, func(v *types.Var) {
-		candidates = append(candidates, candidate{
+		cb(candidate{
 			obj:         v,
 			score:       stdScore - 0.01,
 			imp:         imp,
 			addressable: addressable || isPointer(typ),
 		})
 	})
-
-	return candidates
 }
 
 // lexical finds completions in the lexical environment.
@@ -1264,6 +1273,12 @@ func (c *completer) lexical(ctx context.Context) error {
 	var (
 		builtinIota = types.Universe.Lookup("iota")
 		builtinNil  = types.Universe.Lookup("nil")
+		// comparable is an interface that exists on the dev.typeparams Go branch.
+		// Filter it out from completion results to stabilize tests.
+		// TODO(rFindley) update (or remove) our handling for comparable once the
+		//                type parameter API has stabilized.
+		builtinAny        = types.Universe.Lookup("any")
+		builtinComparable = types.Universe.Lookup("comparable")
 	)
 
 	// Track seen variables to avoid showing completions for shadowed variables.
@@ -1281,6 +1296,9 @@ func (c *completer) lexical(ctx context.Context) error {
 			declScope, obj := scope.LookupParent(name, c.pos)
 			if declScope != scope {
 				continue // Name was declared in some enclosing scope, or not at all.
+			}
+			if obj == builtinComparable || obj == builtinAny {
+				continue
 			}
 
 			// If obj's type is invalid, find the AST node that defines the lexical block
@@ -1409,6 +1427,13 @@ func (c *completer) unimportedPackages(ctx context.Context, seen map[string]stru
 	if c.surrounding != nil {
 		prefix = c.surrounding.Prefix()
 	}
+
+	// Don't suggest unimported packages if we have absolutely nothing
+	// to go on.
+	if prefix == "" {
+		return nil
+	}
+
 	count := 0
 
 	known, err := c.snapshot.CachedImportPaths(ctx)
@@ -1433,8 +1458,15 @@ func (c *completer) unimportedPackages(ctx context.Context, seen map[string]stru
 			return err
 		}
 	}
+
 	sort.Slice(paths, func(i, j int) bool {
-		return relevances[paths[i]] > relevances[paths[j]]
+		if relevances[paths[i]] != relevances[paths[j]] {
+			return relevances[paths[i]] > relevances[paths[j]]
+		}
+
+		// Fall back to lexical sort to keep truncated set of candidates
+		// in a consistent order.
+		return paths[i] < paths[j]
 	})
 
 	for _, path := range paths {
@@ -1453,7 +1485,8 @@ func (c *completer) unimportedPackages(ctx context.Context, seen map[string]stru
 			return nil
 		}
 		c.deepState.enqueue(candidate{
-			obj:   types.NewPkgName(0, nil, pkg.GetTypes().Name(), pkg.GetTypes()),
+			// Pass an empty *types.Package to disable deep completions.
+			obj:   types.NewPkgName(0, nil, pkg.GetTypes().Name(), types.NewPackage(path, pkg.Name())),
 			score: unimportedScore(relevances[path]),
 			imp:   imp,
 		})
@@ -1675,6 +1708,12 @@ func enclosingFunction(path []ast.Node, info *types.Info) *funcInfo {
 			}
 		case *ast.FuncLit:
 			if typ, ok := info.Types[t]; ok {
+				if sig, _ := typ.Type.(*types.Signature); sig == nil {
+					// golang/go#49397: it should not be possible, but we somehow arrived
+					// here with a non-signature type, most likely due to AST mangling
+					// such that node.Type is not a FuncType.
+					return nil
+				}
 				return &funcInfo{
 					sig:  typ.Type.(*types.Signature),
 					body: t.Body,
@@ -1690,12 +1729,12 @@ func (c *completer) expectedCompositeLiteralType() types.Type {
 	switch t := clInfo.clType.(type) {
 	case *types.Slice:
 		if clInfo.inKey {
-			return types.Typ[types.Int]
+			return types.Typ[types.UntypedInt]
 		}
 		return t.Elem()
 	case *types.Array:
 		if clInfo.inKey {
-			return types.Typ[types.Int]
+			return types.Typ[types.UntypedInt]
 		}
 		return t.Elem()
 	case *types.Map:
@@ -1733,20 +1772,24 @@ func (c *completer) expectedCompositeLiteralType() types.Type {
 	return nil
 }
 
-// typeModifier represents an operator that changes the expected type.
-type typeModifier struct {
-	mod      typeMod
+// typeMod represents an operator that changes the expected type.
+type typeMod struct {
+	mod      typeModKind
 	arrayLen int64
 }
 
-type typeMod int
+type typeModKind int
 
 const (
-	dereference typeMod = iota // pointer indirection: "*"
-	reference                  // adds level of pointer: "&" for values, "*" for type names
-	chanRead                   // channel read operator ("<-")
-	slice                      // make a slice type ("[]" in "[]int")
-	array                      // make an array type ("[2]" in "[2]int")
+	dereference   typeModKind = iota // pointer indirection: "*"
+	reference                        // adds level of pointer: "&" for values, "*" for type names
+	chanRead                         // channel read operator: "<-"
+	sliceType                        // make a slice type: "[]" in "[]int"
+	arrayType                        // make an array type: "[2]" in "[2]int"
+	invoke                           // make a function call: "()" in "foo()"
+	takeSlice                        // take slice of array: "[:]" in "foo[:]"
+	takeDotDotDot                    // turn slice into variadic args: "..." in "foo..."
+	index                            // index into slice/array: "[0]" in "foo[0]"
 )
 
 type objKind int
@@ -1797,7 +1840,7 @@ type candidateInference struct {
 
 	// modifiers are prefixes such as "*", "&" or "<-" that influence how
 	// a candidate type relates to the expected type.
-	modifiers []typeModifier
+	modifiers []typeMod
 
 	// convertibleTo is a type our candidate type must be convertible to.
 	convertibleTo types.Type
@@ -1847,7 +1890,7 @@ type typeNameInference struct {
 
 	// modifiers are prefixes such as "*", "&" or "<-" that influence how
 	// a candidate type relates to the expected type.
-	modifiers []typeModifier
+	modifiers []typeMod
 
 	// assertableFrom is a type that must be assertable to our candidate type.
 	assertableFrom types.Type
@@ -2038,7 +2081,7 @@ Nodes:
 		case *ast.SliceExpr:
 			// Make sure position falls within the brackets (e.g. "foo[a:<>]").
 			if node.Lbrack < c.pos && c.pos <= node.Rbrack {
-				inf.objType = types.Typ[types.Int]
+				inf.objType = types.Typ[types.UntypedInt]
 			}
 			return inf
 		case *ast.IndexExpr:
@@ -2049,7 +2092,7 @@ Nodes:
 					case *types.Map:
 						inf.objType = t.Key()
 					case *types.Slice, *types.Array:
-						inf.objType = types.Typ[types.Int]
+						inf.objType = types.Typ[types.UntypedInt]
 					}
 				}
 			}
@@ -2073,13 +2116,13 @@ Nodes:
 			}
 			return inf
 		case *ast.StarExpr:
-			inf.modifiers = append(inf.modifiers, typeModifier{mod: dereference})
+			inf.modifiers = append(inf.modifiers, typeMod{mod: dereference})
 		case *ast.UnaryExpr:
 			switch node.Op {
 			case token.AND:
-				inf.modifiers = append(inf.modifiers, typeModifier{mod: reference})
+				inf.modifiers = append(inf.modifiers, typeMod{mod: reference})
 			case token.ARROW:
-				inf.modifiers = append(inf.modifiers, typeModifier{mod: chanRead})
+				inf.modifiers = append(inf.modifiers, typeMod{mod: chanRead})
 			}
 		case *ast.DeferStmt, *ast.GoStmt:
 			inf.objKind |= kindFunc
@@ -2174,9 +2217,9 @@ func (ci candidateInference) applyTypeNameModifiers(typ types.Type) types.Type {
 		switch mod.mod {
 		case reference:
 			typ = types.NewPointer(typ)
-		case array:
+		case arrayType:
 			typ = types.NewArray(typ, mod.arrayLen)
-		case slice:
+		case sliceType:
 			typ = types.NewSlice(typ)
 		}
 	}
@@ -2290,7 +2333,7 @@ Nodes:
 			}
 			return typeNameInference{}
 		case *ast.StarExpr:
-			inf.modifiers = append(inf.modifiers, typeModifier{mod: reference})
+			inf.modifiers = append(inf.modifiers, typeMod{mod: reference})
 		case *ast.CompositeLit:
 			// We want a type name if position is in the "Type" part of a
 			// composite literal (e.g. "Foo<>{}").
@@ -2303,7 +2346,7 @@ Nodes:
 					// the composite literal and not the type name, but if
 					// affects our type completion nonetheless.
 					if u, ok := c.path[i+1].(*ast.UnaryExpr); ok && u.Op == token.AND {
-						inf.modifiers = append(inf.modifiers, typeModifier{mod: reference})
+						inf.modifiers = append(inf.modifiers, typeMod{mod: reference})
 					}
 				}
 			}
@@ -2314,13 +2357,13 @@ Nodes:
 				inf.wantTypeName = true
 				if n.Len == nil {
 					// No "Len" expression means a slice type.
-					inf.modifiers = append(inf.modifiers, typeModifier{mod: slice})
+					inf.modifiers = append(inf.modifiers, typeMod{mod: sliceType})
 				} else {
 					// Try to get the array type using the constant value of "Len".
 					tv, ok := c.pkg.GetTypesInfo().Types[n.Len]
 					if ok && tv.Value != nil && tv.Value.Kind() == constant.Int {
 						if arrayLen, ok := constant.Int64Val(tv.Value); ok {
-							inf.modifiers = append(inf.modifiers, typeModifier{mod: array, arrayLen: arrayLen})
+							inf.modifiers = append(inf.modifiers, typeMod{mod: arrayType, arrayLen: arrayLen})
 						}
 					}
 				}
@@ -2364,77 +2407,82 @@ func (c *completer) fakeObj(T types.Type) *types.Var {
 	return types.NewVar(token.NoPos, c.pkg.GetTypes(), "", T)
 }
 
+// derivableTypes iterates types you can derive from t. For example,
+// from "foo" we might derive "&foo", and "foo()".
+func derivableTypes(t types.Type, addressable bool, f func(t types.Type, addressable bool, mod typeModKind) bool) bool {
+	switch t := t.Underlying().(type) {
+	case *types.Signature:
+		// If t is a func type with a single result, offer the result type.
+		if t.Results().Len() == 1 && f(t.Results().At(0).Type(), false, invoke) {
+			return true
+		}
+	case *types.Array:
+		if f(t.Elem(), true, index) {
+			return true
+		}
+		// Try converting array to slice.
+		if f(types.NewSlice(t.Elem()), false, takeSlice) {
+			return true
+		}
+	case *types.Pointer:
+		if f(t.Elem(), false, dereference) {
+			return true
+		}
+	case *types.Slice:
+		if f(t.Elem(), true, index) {
+			return true
+		}
+	case *types.Map:
+		if f(t.Elem(), false, index) {
+			return true
+		}
+	case *types.Chan:
+		if f(t.Elem(), false, chanRead) {
+			return true
+		}
+	}
+
+	// Check if c is addressable and a pointer to c matches our type inference.
+	if addressable && f(types.NewPointer(t), false, reference) {
+		return true
+	}
+
+	return false
+}
+
 // anyCandType reports whether f returns true for any candidate type
-// derivable from c. For example, from "foo" we might derive "&foo",
-// and "foo()".
+// derivable from c. It searches up to three levels of type
+// modification. For example, given "foo" we could discover "***foo"
+// or "*foo()".
 func (c *candidate) anyCandType(f func(t types.Type, addressable bool) bool) bool {
 	if c.obj == nil || c.obj.Type() == nil {
 		return false
 	}
 
-	objType := c.obj.Type()
+	const maxDepth = 3
 
-	if f(objType, c.addressable) {
-		return true
-	}
-
-	// If c is a func type with a single result, offer the result type.
-	if sig, ok := objType.Underlying().(*types.Signature); ok {
-		if sig.Results().Len() == 1 && f(sig.Results().At(0).Type(), false) {
-			// Mark the candidate so we know to append "()" when formatting.
-			c.expandFuncCall = true
-			return true
-		}
-	}
-
-	var (
-		seenPtrTypes map[types.Type]bool
-		ptrType      = objType
-		ptrDepth     int
-	)
-
-	// Check if dereferencing c would match our type inference. We loop
-	// since c could have arbitrary levels of pointerness.
-	for {
-		ptr, ok := ptrType.Underlying().(*types.Pointer)
-		if !ok {
-			break
-		}
-
-		ptrDepth++
-
-		// Avoid pointer type cycles.
-		if seenPtrTypes[ptrType] {
-			break
-		}
-
-		if _, named := ptrType.(*types.Named); named {
-			// Lazily allocate "seen" since it isn't used normally.
-			if seenPtrTypes == nil {
-				seenPtrTypes = make(map[types.Type]bool)
+	var searchTypes func(t types.Type, addressable bool, mods []typeModKind) bool
+	searchTypes = func(t types.Type, addressable bool, mods []typeModKind) bool {
+		if f(t, addressable) {
+			if len(mods) > 0 {
+				newMods := make([]typeModKind, len(mods)+len(c.mods))
+				copy(newMods, mods)
+				copy(newMods[len(mods):], c.mods)
+				c.mods = newMods
 			}
-
-			// Track named pointer types we have seen to detect cycles.
-			seenPtrTypes[ptrType] = true
-		}
-
-		if f(ptr.Elem(), false) {
-			// Mark the candidate so we know to prepend "*" when formatting.
-			c.dereference = ptrDepth
 			return true
 		}
 
-		ptrType = ptr.Elem()
+		if len(mods) == maxDepth {
+			return false
+		}
+
+		return derivableTypes(t, addressable, func(t types.Type, addressable bool, mod typeModKind) bool {
+			return searchTypes(t, addressable, append(mods, mod))
+		})
 	}
 
-	// Check if c is addressable and a pointer to c matches our type inference.
-	if c.addressable && f(types.NewPointer(objType), false) {
-		// Mark the candidate so we know to prepend "&" when formatting.
-		c.takeAddress = true
-		return true
-	}
-
-	return false
+	return searchTypes(c.obj.Type(), c.addressable, make([]typeModKind, 0, maxDepth))
 }
 
 // matchingCandidate reports whether cand matches our type inferences.
@@ -2442,6 +2490,11 @@ func (c *candidate) anyCandType(f func(t types.Type, addressable bool) bool) boo
 func (c *completer) matchingCandidate(cand *candidate) bool {
 	if c.completionContext.commentCompletion {
 		return false
+	}
+
+	// Bail out early if we are completing a field name in a composite literal.
+	if v, ok := cand.obj.(*types.Var); ok && v.IsField() && c.wantStructFieldCompletions() {
+		return true
 	}
 
 	if isTypeName(cand.obj) {
@@ -2463,7 +2516,7 @@ func (c *completer) matchingCandidate(cand *candidate) bool {
 	if sig, ok := candType.Underlying().(*types.Signature); ok {
 		if c.inference.assigneesMatch(cand, sig) {
 			// Invoke the candidate if its results are multi-assignable.
-			cand.expandFuncCall = true
+			cand.mods = append(cand.mods, invoke)
 			return true
 		}
 	}
@@ -2471,7 +2524,9 @@ func (c *completer) matchingCandidate(cand *candidate) bool {
 	// Default to invoking *types.Func candidates. This is so function
 	// completions in an empty statement (or other cases with no expected type)
 	// are invoked by default.
-	cand.expandFuncCall = isFunc(cand.obj)
+	if isFunc(cand.obj) {
+		cand.mods = append(cand.mods, invoke)
+	}
 
 	return false
 }
@@ -2509,7 +2564,7 @@ func (ci *candidateInference) candTypeMatches(cand *candidate) bool {
 				continue
 			}
 
-			matches, untyped := ci.typeMatches(expType, candType)
+			matches := ci.typeMatches(expType, candType)
 			if !matches {
 				// If candType doesn't otherwise match, consider if we can
 				// convert candType directly to expType.
@@ -2525,13 +2580,13 @@ func (ci *candidateInference) candTypeMatches(cand *candidate) bool {
 			}
 
 			if expType == variadicType {
-				cand.variadic = true
+				cand.mods = append(cand.mods, takeDotDotDot)
 			}
 
 			// Lower candidate score for untyped conversions. This avoids
 			// ranking untyped constants above candidates with an exact type
 			// match. Don't lower score of builtin constants, e.g. "true".
-			if untyped && !types.Identical(candType, expType) && cand.obj.Parent() != types.Universe {
+			if isUntyped(candType) && !types.Identical(candType, expType) && cand.obj.Parent() != types.Universe {
 				// Bigger penalty for deep completions into other packages to
 				// avoid random constants from other packages popping up all
 				// the time.
@@ -2564,7 +2619,7 @@ func (ci *candidateInference) candTypeMatches(cand *candidate) bool {
 			// matches.
 			if ci.kindMatches(candType) {
 				if ci.objKind == kindFunc {
-					cand.expandFuncCall = true
+					cand.mods = append(cand.mods, invoke)
 				}
 				return true
 			}
@@ -2598,21 +2653,34 @@ func considerTypeConversion(from, to types.Type, path []types.Object) bool {
 }
 
 // typeMatches reports whether an object of candType makes a good
-// completion candidate given the expected type expType. It also
-// returns a second bool which is true if both types are basic types
-// of the same kind, and at least one is untyped.
-func (ci *candidateInference) typeMatches(expType, candType types.Type) (bool, bool) {
+// completion candidate given the expected type expType.
+func (ci *candidateInference) typeMatches(expType, candType types.Type) bool {
 	// Handle untyped values specially since AssignableTo gives false negatives
 	// for them (see https://golang.org/issue/32146).
 	if candBasic, ok := candType.Underlying().(*types.Basic); ok {
-		if wantBasic, ok := expType.Underlying().(*types.Basic); ok {
-			// Make sure at least one of them is untyped.
-			if isUntyped(candType) || isUntyped(expType) {
-				// Check that their constant kind (bool|int|float|complex|string) matches.
+		if expBasic, ok := expType.Underlying().(*types.Basic); ok {
+			// Note that the candidate and/or the expected can be untyped.
+			// In "fo<> == 100" the expected type is untyped, and the
+			// candidate could also be an untyped constant.
+
+			// Sort by is_untyped and then by is_int to simplify below logic.
+			a, b := candBasic.Info(), expBasic.Info()
+			if a&types.IsUntyped == 0 || (b&types.IsInteger > 0 && b&types.IsUntyped > 0) {
+				a, b = b, a
+			}
+
+			// If at least one is untyped...
+			if a&types.IsUntyped > 0 {
+				switch {
+				// Untyped integers are compatible with floats.
+				case a&types.IsInteger > 0 && b&types.IsFloat > 0:
+					return true
+
+				// Check if their constant kind (bool|int|float|complex|string) matches.
 				// This doesn't take into account the constant value, so there will be some
 				// false positives due to integer sign and overflow.
-				if candBasic.Info()&types.IsConstType == wantBasic.Info()&types.IsConstType {
-					return true, true
+				case a&types.IsConstType == b&types.IsConstType:
+					return true
 				}
 			}
 		}
@@ -2620,7 +2688,7 @@ func (ci *candidateInference) typeMatches(expType, candType types.Type) (bool, b
 
 	// AssignableTo covers the case where the types are equal, but also handles
 	// cases like assigning a concrete type to an interface type.
-	return types.AssignableTo(candType, expType), false
+	return types.AssignableTo(candType, expType)
 }
 
 // kindMatches reports whether candType's kind matches our expected
@@ -2639,6 +2707,12 @@ func (ci *candidateInference) assigneesMatch(cand *candidate, sig *types.Signatu
 	// Uniresult functions are always usable and are handled by the
 	// normal, non-assignees type matching logic.
 	if sig.Results().Len() == 1 {
+		return false
+	}
+
+	// Don't prefer completing into func(...interface{}) calls since all
+	// functions wouuld match.
+	if ci.variadicAssignees && len(ci.assignees) == 1 && isEmptyInterface(deslice(ci.assignees[0])) {
 		return false
 	}
 
@@ -2681,7 +2755,7 @@ func (ci *candidateInference) assigneesMatch(cand *candidate, sig *types.Signatu
 			continue
 		}
 
-		allMatch, _ = ci.typeMatches(assignee, sig.Results().At(i).Type())
+		allMatch = ci.typeMatches(assignee, sig.Results().At(i).Type())
 		if !allMatch {
 			break
 		}
@@ -2748,11 +2822,11 @@ func (c *completer) matchingTypeName(cand *candidate) bool {
 		if c.inference.typeName.compLitType {
 			// If we are completing a composite literal type as in
 			// "foo<>{}", to make a pointer we must prepend "&".
-			cand.takeAddress = true
+			cand.mods = append(cand.mods, reference)
 		} else {
 			// If we are completing a normal type name such as "foo<>", to
 			// make a pointer we must prepend "*".
-			cand.makePointer = true
+			cand.mods = append(cand.mods, dereference)
 		}
 		return true
 	}

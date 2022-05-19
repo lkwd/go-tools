@@ -70,7 +70,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			fieldList, body = f.Type.Params, f.Body
 		}
 		// If there are no arguments or the function is empty, then return.
-		if fieldList.NumFields() == 0 || len(body.List) == 0 {
+		if fieldList.NumFields() == 0 || body == nil || len(body.List) == 0 {
 			return
 		}
 
@@ -131,13 +131,20 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				start, end = u.ident.Pos(), u.ident.End()
 			}
 			// TODO(golang/go#36602): Add suggested fixes to automatically
-			// remove the unused parameter. To start, just remove it from the
-			// function declaration. Later, remove it from every use of this
+			// remove the unused parameter from every use of this
 			// function.
 			pass.Report(analysis.Diagnostic{
 				Pos:     start,
 				End:     end,
 				Message: fmt.Sprintf("potentially unused parameter: '%s'", u.ident.Name),
+				SuggestedFixes: []analysis.SuggestedFix{{
+					Message: `Replace with "_"`,
+					TextEdits: []analysis.TextEdit{{
+						Pos:     u.ident.Pos(),
+						End:     u.ident.End(),
+						NewText: []byte("_"),
+					}},
+				}},
 			})
 		}
 	})

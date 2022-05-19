@@ -18,6 +18,7 @@ import (
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/protocol"
+	"golang.org/x/tools/internal/typeparams"
 )
 
 // FormatType returns the detail and kind for a types.Type.
@@ -38,10 +39,10 @@ func FormatType(typ types.Type, qf types.Qualifier) (detail string, kind protoco
 }
 
 type signature struct {
-	name, doc        string
-	params, results  []string
-	variadic         bool
-	needResultParens bool
+	name, doc                   string
+	typeParams, params, results []string
+	variadic                    bool
+	needResultParens            bool
 }
 
 func (s *signature) Format() string {
@@ -74,6 +75,10 @@ func (s *signature) Format() string {
 	return b.String()
 }
 
+func (s *signature) TypeParams() []string {
+	return s.typeParams
+}
+
 func (s *signature) Params() []string {
 	return s.params
 }
@@ -81,11 +86,11 @@ func (s *signature) Params() []string {
 // NewBuiltinSignature returns signature for the builtin object with a given
 // name, if a builtin object with the name exists.
 func NewBuiltinSignature(ctx context.Context, s Snapshot, name string) (*signature, error) {
-	builtin, err := s.BuiltinPackage(ctx)
+	builtin, err := s.BuiltinFile(ctx)
 	if err != nil {
 		return nil, err
 	}
-	obj := builtin.Package.Scope.Lookup(name)
+	obj := builtin.File.Scope.Lookup(name)
 	if obj == nil {
 		return nil, fmt.Errorf("no builtin object for %s", name)
 	}
@@ -167,8 +172,36 @@ func formatFieldList(ctx context.Context, snapshot Snapshot, list *ast.FieldList
 	return result, writeResultParens
 }
 
+// FormatTypeParams turns TypeParamList into its Go representation, such as:
+// [T, Y]. Note that it does not print constraints as this is mainly used for
+// formatting type params in method receivers.
+func FormatTypeParams(tparams *typeparams.TypeParamList) string {
+	if tparams == nil || tparams.Len() == 0 {
+		return ""
+	}
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	for i := 0; i < tparams.Len(); i++ {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(tparams.At(i).Obj().Name())
+	}
+	buf.WriteByte(']')
+	return buf.String()
+}
+
 // NewSignature returns formatted signature for a types.Signature struct.
 func NewSignature(ctx context.Context, s Snapshot, pkg Package, sig *types.Signature, comment *ast.CommentGroup, qf types.Qualifier) *signature {
+	var tparams []string
+	tpList := typeparams.ForSignature(sig)
+	for i := 0; i < tpList.Len(); i++ {
+		tparam := tpList.At(i)
+		// TODO: is it possible to reuse the logic from FormatVarType here?
+		s := tparam.Obj().Name() + " " + tparam.Constraint().String()
+		tparams = append(tparams, s)
+	}
+
 	params := make([]string, 0, sig.Params().Len())
 	for i := 0; i < sig.Params().Len(); i++ {
 		el := sig.Params().At(i)
@@ -179,6 +212,7 @@ func NewSignature(ctx context.Context, s Snapshot, pkg Package, sig *types.Signa
 		}
 		params = append(params, p)
 	}
+
 	var needResultParens bool
 	results := make([]string, 0, sig.Results().Len())
 	for i := 0; i < sig.Results().Len(); i++ {
@@ -208,6 +242,7 @@ func NewSignature(ctx context.Context, s Snapshot, pkg Package, sig *types.Signa
 	}
 	return &signature{
 		doc:              d,
+		typeParams:       tparams,
 		params:           params,
 		results:          results,
 		variadic:         sig.Variadic(),
@@ -219,13 +254,21 @@ func NewSignature(ctx context.Context, s Snapshot, pkg Package, sig *types.Signa
 // To do this, it looks in the AST of the file in which the object is declared.
 // On any errors, it always fallbacks back to types.TypeString.
 func FormatVarType(ctx context.Context, snapshot Snapshot, srcpkg Package, obj *types.Var, qf types.Qualifier) string {
-	pgf, pkg, err := FindPosInPackage(snapshot, srcpkg, obj.Pos())
+	pkg, err := FindPackageFromPos(ctx, snapshot, obj.Pos())
 	if err != nil {
 		return types.TypeString(obj.Type(), qf)
 	}
 
-	expr, err := varType(ctx, snapshot, pgf, obj)
+	expr, err := varType(ctx, snapshot, pkg, obj)
 	if err != nil {
+		return types.TypeString(obj.Type(), qf)
+	}
+
+	// If the given expr refers to a type parameter, then use the
+	// object's Type instead of the type parameter declaration. This helps
+	// format the instantiated type as opposed to the original undeclared
+	// generic type.
+	if typeparams.IsTypeParam(pkg.GetTypesInfo().Types[expr].Type) {
 		return types.TypeString(obj.Type(), qf)
 	}
 
@@ -244,20 +287,15 @@ func FormatVarType(ctx context.Context, snapshot Snapshot, srcpkg Package, obj *
 }
 
 // varType returns the type expression for a *types.Var.
-func varType(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, obj *types.Var) (ast.Expr, error) {
-	posToField, err := snapshot.PosToField(ctx, pgf)
+func varType(ctx context.Context, snapshot Snapshot, pkg Package, obj *types.Var) (ast.Expr, error) {
+	field, err := snapshot.PosToField(ctx, pkg, obj.Pos())
 	if err != nil {
 		return nil, err
 	}
-	field := posToField[obj.Pos()]
 	if field == nil {
 		return nil, fmt.Errorf("no declaration for object %s", obj.Name())
 	}
-	typ, ok := field.Type.(ast.Expr)
-	if !ok {
-		return nil, fmt.Errorf("unexpected type for node (%T)", field.Type)
-	}
-	return typ, nil
+	return field.Type, nil
 }
 
 // qualifyExpr applies the "pkgName." prefix to any *ast.Ident in the expr.

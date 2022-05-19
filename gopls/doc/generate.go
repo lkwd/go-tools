@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build go1.16
+// +build go1.16
+
 // Command generate creates API (settings, etc) documentation in JSON and
 // Markdown for machine and human consumption.
 package main
@@ -26,9 +29,11 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/sanity-io/litter"
+	"github.com/jba/printsrc"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/internal/lsp/command"
+	"golang.org/x/tools/internal/lsp/command/commandmeta"
 	"golang.org/x/tools/internal/lsp/mod"
 	"golang.org/x/tools/internal/lsp/source"
 )
@@ -87,9 +92,9 @@ func loadAPI() (*source.APIJSON, error) {
 
 	// Transform the internal command name to the external command name.
 	for _, c := range api.Commands {
-		c.Command = source.CommandPrefix + c.Command
+		c.Command = command.ID(c.Command)
 	}
-	for _, m := range []map[string]source.Analyzer{
+	for _, m := range []map[string]*source.Analyzer{
 		defaults.DefaultAnalyzers,
 		defaults.TypeErrorAnalyzers,
 		defaults.ConvenienceAnalyzers,
@@ -368,90 +373,93 @@ func valueDoc(name, value, doc string) string {
 }
 
 func loadCommands(pkg *packages.Package) ([]*source.CommandJSON, error) {
-	// The code that defines commands is much more complicated than the
-	// code that defines options, so reading comments for the Doc is very
-	// fragile. If this causes problems, we should switch to a dynamic
-	// approach and put the doc in the Commands struct rather than reading
-	// from the source code.
+	var commands []*source.CommandJSON
 
-	// Find the Commands slice.
-	typesSlice := pkg.Types.Scope().Lookup("Commands")
-	f, err := fileForPos(pkg, typesSlice.Pos())
+	_, cmds, err := commandmeta.Load()
 	if err != nil {
 		return nil, err
 	}
-	path, _ := astutil.PathEnclosingInterval(f, typesSlice.Pos(), typesSlice.Pos())
-	vspec := path[1].(*ast.ValueSpec)
-	var astSlice *ast.CompositeLit
-	for i, name := range vspec.Names {
-		if name.Name == "Commands" {
-			astSlice = vspec.Values[i].(*ast.CompositeLit)
-		}
-	}
-
-	var commands []*source.CommandJSON
-
 	// Parse the objects it contains.
-	for _, elt := range astSlice.Elts {
-		// Find the composite literal of the Command.
-		typesCommand := pkg.TypesInfo.ObjectOf(elt.(*ast.Ident))
-		path, _ := astutil.PathEnclosingInterval(f, typesCommand.Pos(), typesCommand.Pos())
-		vspec := path[1].(*ast.ValueSpec)
-
-		var astCommand ast.Expr
-		for i, name := range vspec.Names {
-			if name.Name == typesCommand.Name() {
-				astCommand = vspec.Values[i]
-			}
+	for _, cmd := range cmds {
+		cmdjson := &source.CommandJSON{
+			Command: cmd.Name,
+			Title:   cmd.Title,
+			Doc:     cmd.Doc,
+			ArgDoc:  argsDoc(cmd.Args),
 		}
-
-		// Read the Name and Title fields of the literal.
-		var name, title string
-		ast.Inspect(astCommand, func(n ast.Node) bool {
-			kv, ok := n.(*ast.KeyValueExpr)
-			if ok {
-				k := kv.Key.(*ast.Ident).Name
-				switch k {
-				case "Name":
-					name = strings.Trim(kv.Value.(*ast.BasicLit).Value, `"`)
-				case "Title":
-					title = strings.Trim(kv.Value.(*ast.BasicLit).Value, `"`)
-				}
-			}
-			return true
-		})
-
-		if title == "" {
-			title = name
+		if cmd.Result != nil {
+			cmdjson.ResultDoc = typeDoc(cmd.Result, 0)
 		}
-
-		// Conventionally, the doc starts with the name of the variable.
-		// Replace it with the name of the command.
-		doc := vspec.Doc.Text()
-		doc = strings.Replace(doc, typesCommand.Name(), name, 1)
-
-		commands = append(commands, &source.CommandJSON{
-			Command: name,
-			Title:   title,
-			Doc:     doc,
-		})
+		commands = append(commands, cmdjson)
 	}
 	return commands, nil
 }
 
+func argsDoc(args []*commandmeta.Field) string {
+	var b strings.Builder
+	for i, arg := range args {
+		b.WriteString(typeDoc(arg, 0))
+		if i != len(args)-1 {
+			b.WriteString(",\n")
+		}
+	}
+	return b.String()
+}
+
+func typeDoc(arg *commandmeta.Field, level int) string {
+	// Max level to expand struct fields.
+	const maxLevel = 3
+	if len(arg.Fields) > 0 {
+		if level < maxLevel {
+			return arg.FieldMod + structDoc(arg.Fields, level)
+		}
+		return "{ ... }"
+	}
+	under := arg.Type.Underlying()
+	switch u := under.(type) {
+	case *types.Slice:
+		return fmt.Sprintf("[]%s", u.Elem().Underlying().String())
+	}
+	return types.TypeString(under, nil)
+}
+
+func structDoc(fields []*commandmeta.Field, level int) string {
+	var b strings.Builder
+	b.WriteString("{\n")
+	indent := strings.Repeat("\t", level)
+	for _, fld := range fields {
+		if fld.Doc != "" && level == 0 {
+			doclines := strings.Split(fld.Doc, "\n")
+			for _, line := range doclines {
+				fmt.Fprintf(&b, "%s\t// %s\n", indent, line)
+			}
+		}
+		tag := fld.JSONTag
+		if tag == "" {
+			tag = fld.Name
+		}
+		fmt.Fprintf(&b, "%s\t%q: %s,\n", indent, tag, typeDoc(fld, level+1))
+	}
+	fmt.Fprintf(&b, "%s}", indent)
+	return b.String()
+}
+
 func loadLenses(commands []*source.CommandJSON) []*source.LensJSON {
-	lensNames := map[string]struct{}{}
+	all := map[command.Command]struct{}{}
 	for k := range source.LensFuncs() {
-		lensNames[k] = struct{}{}
+		all[k] = struct{}{}
 	}
 	for k := range mod.LensFuncs() {
-		lensNames[k] = struct{}{}
+		if _, ok := all[k]; ok {
+			panic(fmt.Sprintf("duplicate lens %q", string(k)))
+		}
+		all[k] = struct{}{}
 	}
 
 	var lenses []*source.LensJSON
 
 	for _, cmd := range commands {
-		if _, ok := lensNames[cmd.Command]; ok {
+		if _, ok := all[command.Command(cmd.Command)]; ok {
 			lenses = append(lenses, &source.LensJSON{
 				Lens:  cmd.Command,
 				Title: cmd.Title,
@@ -462,7 +470,7 @@ func loadLenses(commands []*source.CommandJSON) []*source.LensJSON {
 	return lenses
 }
 
-func loadAnalyzers(m map[string]source.Analyzer) []*source.AnalyzerJSON {
+func loadAnalyzers(m map[string]*source.Analyzer) []*source.AnalyzerJSON {
 	var sorted []string
 	for _, a := range m {
 		sorted = append(sorted, a.Analyzer.Name)
@@ -527,27 +535,13 @@ func rewriteFile(file string, api *source.APIJSON, write bool, rewrite func([]by
 }
 
 func rewriteAPI(_ []byte, api *source.APIJSON) ([]byte, error) {
-	buf := bytes.NewBuffer(nil)
-	apiStr := litter.Options{
-		HomePackage: "source",
-	}.Sdump(api)
-	// Massive hack: filter out redundant types from the composite literal.
-	apiStr = strings.ReplaceAll(apiStr, "&OptionJSON", "")
-	apiStr = strings.ReplaceAll(apiStr, ": []*OptionJSON", ":")
-	apiStr = strings.ReplaceAll(apiStr, "&CommandJSON", "")
-	apiStr = strings.ReplaceAll(apiStr, "&LensJSON", "")
-	apiStr = strings.ReplaceAll(apiStr, "&AnalyzerJSON", "")
-	apiStr = strings.ReplaceAll(apiStr, "  EnumValue{", "{")
-	apiStr = strings.ReplaceAll(apiStr, "  EnumKey{", "{")
-	apiBytes, err := format.Source([]byte(apiStr))
-	if err != nil {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "// Code generated by \"golang.org/x/tools/gopls/doc/generate\"; DO NOT EDIT.\n\npackage source\n\nvar GeneratedAPIJSON = ")
+	if err := printsrc.NewPrinter("golang.org/x/tools/internal/lsp/source").Fprint(&buf, api); err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(buf, "// Code generated by \"golang.org/x/tools/gopls/doc/generate\"; DO NOT EDIT.\n\npackage source\n\nvar GeneratedAPIJSON = %s\n", apiBytes)
-	return buf.Bytes(), nil
+	return format.Source(buf.Bytes())
 }
-
-var parBreakRE = regexp.MustCompile("\n{2,}")
 
 type optionsGroup struct {
 	title   string
@@ -577,10 +571,8 @@ func rewriteSettings(doc []byte, api *source.APIJSON) ([]byte, error) {
 			writeTitle(section, h.final, level)
 			for _, opt := range h.options {
 				header := strMultiply("#", level+1)
-				fmt.Fprintf(section, "%s **%v** *%v*\n\n", header, opt.Name, opt.Type)
-				writeStatus(section, opt.Status)
-				enumValues := collectEnums(opt)
-				fmt.Fprintf(section, "%v%v\nDefault: `%v`.\n\n", opt.Doc, enumValues, opt.Default)
+				section.Write([]byte(fmt.Sprintf("%s ", header)))
+				opt.Write(section)
 			}
 		}
 		var err error
@@ -651,38 +643,6 @@ func collectGroups(opts []*source.OptionJSON) []optionsGroup {
 	return groups
 }
 
-func collectEnums(opt *source.OptionJSON) string {
-	var b strings.Builder
-	write := func(name, doc string, index, len int) {
-		if doc != "" {
-			unbroken := parBreakRE.ReplaceAllString(doc, "\\\n")
-			fmt.Fprintf(&b, "* %s", unbroken)
-		} else {
-			fmt.Fprintf(&b, "* `%s`", name)
-		}
-		if index < len-1 {
-			fmt.Fprint(&b, "\n")
-		}
-	}
-	if len(opt.EnumValues) > 0 && opt.Type == "enum" {
-		b.WriteString("\nMust be one of:\n\n")
-		for i, val := range opt.EnumValues {
-			write(val.Value, val.Doc, i, len(opt.EnumValues))
-		}
-	} else if len(opt.EnumKeys.Keys) > 0 && shouldShowEnumKeysInSettings(opt.Name) {
-		b.WriteString("\nCan contain any of:\n\n")
-		for i, val := range opt.EnumKeys.Keys {
-			write(val.Name, val.Doc, i, len(opt.EnumKeys.Keys))
-		}
-	}
-	return b.String()
-}
-
-func shouldShowEnumKeysInSettings(name string) bool {
-	// Both of these fields have too many possible options to print.
-	return !hardcodedEnumKeys(name)
-}
-
 func hardcodedEnumKeys(name string) bool {
 	return name == "analyses" || name == "codelenses"
 }
@@ -704,20 +664,6 @@ func writeTitle(w io.Writer, title string, level int) {
 	fmt.Fprintf(w, "%s %s\n\n", strMultiply("#", level), capitalize(title))
 }
 
-func writeStatus(section io.Writer, status string) {
-	switch status {
-	case "":
-	case "advanced":
-		fmt.Fprint(section, "**This is an advanced setting and should not be configured by most `gopls` users.**\n\n")
-	case "debug":
-		fmt.Fprint(section, "**This setting is for debugging purposes only.**\n\n")
-	case "experimental":
-		fmt.Fprint(section, "**This setting is experimental and may be deleted.**\n\n")
-	default:
-		fmt.Fprintf(section, "**Status: %s.**\n\n", status)
-	}
-}
-
 func capitalize(s string) string {
 	return string(unicode.ToUpper(rune(s[0]))) + s[1:]
 }
@@ -733,7 +679,7 @@ func strMultiply(str string, count int) string {
 func rewriteCommands(doc []byte, api *source.APIJSON) ([]byte, error) {
 	section := bytes.NewBuffer(nil)
 	for _, command := range api.Commands {
-		fmt.Fprintf(section, "### **%v**\nIdentifier: `%v`\n\n%v\n\n", command.Title, command.Command, command.Doc)
+		command.Write(section)
 	}
 	return replaceSection(doc, "Commands", section.Bytes())
 }

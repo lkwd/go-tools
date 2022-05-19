@@ -6,7 +6,6 @@ package source
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/printer"
@@ -18,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
@@ -162,7 +162,9 @@ func posToMappedRange(snapshot Snapshot, pkg Package, pos, end token.Pos) (Mappe
 //	https://golang.org/s/generatedcode
 var generatedRx = regexp.MustCompile(`// .*DO NOT EDIT\.?`)
 
-func DetectLanguage(langID, filename string) FileKind {
+// FileKindForLang returns the file kind associated with the given language ID,
+// or UnknownKind if the language ID is not recognized.
+func FileKindForLang(langID string) FileKind {
 	switch langID {
 	case "go":
 		return Go
@@ -170,26 +172,29 @@ func DetectLanguage(langID, filename string) FileKind {
 		return Mod
 	case "go.sum":
 		return Sum
-	}
-	// Fallback to detecting the language based on the file extension.
-	switch filepath.Ext(filename) {
-	case ".mod":
-		return Mod
-	case ".sum":
-		return Sum
-	default: // fallback to Go
-		return Go
+	case "tmpl", "gotmpl":
+		return Tmpl
+	case "go.work":
+		return Work
+	default:
+		return UnknownKind
 	}
 }
 
 func (k FileKind) String() string {
 	switch k {
+	case Go:
+		return "go"
 	case Mod:
 		return "go.mod"
 	case Sum:
 		return "go.sum"
+	case Tmpl:
+		return "tmpl"
+	case Work:
+		return "go.work"
 	default:
-		return "go"
+		return fmt.Sprintf("unk%d", k)
 	}
 }
 
@@ -223,13 +228,25 @@ func FormatNode(fset *token.FileSet, n ast.Node) string {
 
 // Deref returns a pointer's element type, traversing as many levels as needed.
 // Otherwise it returns typ.
+//
+// It can return a pointer type for cyclic types (see golang/go#45510).
 func Deref(typ types.Type) types.Type {
+	var seen map[types.Type]struct{}
 	for {
 		p, ok := typ.Underlying().(*types.Pointer)
 		if !ok {
 			return typ
 		}
+		if _, ok := seen[p.Elem()]; ok {
+			return typ
+		}
+
 		typ = p.Elem()
+
+		if seen == nil {
+			seen = make(map[types.Type]struct{})
+		}
+		seen[typ] = struct{}{}
 	}
 }
 
@@ -255,20 +272,33 @@ func CompareDiagnostic(a, b *Diagnostic) int {
 	return 1
 }
 
-// FindPosInPackage finds the parsed file for a position in a given search
-// package.
-func FindPosInPackage(snapshot Snapshot, searchpkg Package, pos token.Pos) (*ParsedGoFile, Package, error) {
+// FindPackageFromPos finds the first package containing pos in its
+// type-checked AST.
+func FindPackageFromPos(ctx context.Context, snapshot Snapshot, pos token.Pos) (Package, error) {
 	tok := snapshot.FileSet().File(pos)
 	if tok == nil {
-		return nil, nil, errors.Errorf("no file for pos in package %s", searchpkg.ID())
+		return nil, errors.Errorf("no file for pos %v", pos)
 	}
 	uri := span.URIFromPath(tok.Name())
-
-	pgf, pkg, err := findFileInDeps(searchpkg, uri)
+	pkgs, err := snapshot.PackagesForFile(ctx, uri, TypecheckAll, true)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return pgf, pkg, nil
+	// Only return the package if it actually type-checked the given position.
+	for _, pkg := range pkgs {
+		parsed, err := pkg.File(uri)
+		if err != nil {
+			return nil, err
+		}
+		if parsed == nil {
+			continue
+		}
+		if parsed.Tok.Base() != tok.Base() {
+			continue
+		}
+		return pkg, nil
+	}
+	return nil, errors.Errorf("no package for given file position")
 }
 
 // findFileInDeps finds uri in pkg or its dependencies.
@@ -291,50 +321,6 @@ func findFileInDeps(pkg Package, uri span.URI) (*ParsedGoFile, Package, error) {
 		}
 	}
 	return nil, nil, errors.Errorf("no file for %s in package %s", uri, pkg.ID())
-}
-
-// MarshalArgs encodes the given arguments to json.RawMessages. This function
-// is used to construct arguments to a protocol.Command.
-//
-// Example usage:
-//
-//   jsonArgs, err := EncodeArgs(1, "hello", true, StructuredArg{42, 12.6})
-//
-func MarshalArgs(args ...interface{}) ([]json.RawMessage, error) {
-	var out []json.RawMessage
-	for _, arg := range args {
-		argJSON, err := json.Marshal(arg)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, argJSON)
-	}
-	return out, nil
-}
-
-// UnmarshalArgs decodes the given json.RawMessages to the variables provided
-// by args. Each element of args should be a pointer.
-//
-// Example usage:
-//
-//   var (
-//       num int
-//       str string
-//       bul bool
-//       structured StructuredArg
-//   )
-//   err := UnmarshalArgs(args, &num, &str, &bul, &structured)
-//
-func UnmarshalArgs(jsonArgs []json.RawMessage, args ...interface{}) error {
-	if len(args) != len(jsonArgs) {
-		return fmt.Errorf("DecodeArgs: expected %d input arguments, got %d JSON arguments", len(args), len(jsonArgs))
-	}
-	for i, arg := range args {
-		if err := json.Unmarshal(jsonArgs[i], arg); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // ImportPath returns the unquoted import path of s,
@@ -396,6 +382,9 @@ func Qualifier(f *ast.File, pkg *types.Package, info *types.Info) types.Qualifie
 			return ""
 		}
 		if name, ok := imports[p]; ok {
+			if name == "." {
+				return ""
+			}
 			return name
 		}
 		return p.Name()
@@ -529,4 +518,69 @@ func inDirLex(dir, path string) bool {
 		}
 		return false
 	}
+}
+
+// IsValidImport returns whether importPkgPath is importable
+// by pkgPath
+func IsValidImport(pkgPath, importPkgPath string) bool {
+	i := strings.LastIndex(string(importPkgPath), "/internal/")
+	if i == -1 {
+		return true
+	}
+	if IsCommandLineArguments(string(pkgPath)) {
+		return true
+	}
+	return strings.HasPrefix(string(pkgPath), string(importPkgPath[:i]))
+}
+
+// IsCommandLineArguments reports whether a given value denotes
+// "command-line-arguments" package, which is a package with an unknown ID
+// created by the go command. It can have a test variant, which is why callers
+// should not check that a value equals "command-line-arguments" directly.
+func IsCommandLineArguments(s string) bool {
+	return strings.Contains(s, "command-line-arguments")
+}
+
+// Offset returns tok.Offset(pos), but first checks that the pos is in range
+// for the given file.
+func Offset(tok *token.File, pos token.Pos) (int, error) {
+	if !InRange(tok, pos) {
+		return -1, fmt.Errorf("pos %v is not in range for file [%v:%v)", pos, tok.Base(), tok.Base()+tok.Size())
+	}
+	return tok.Offset(pos), nil
+}
+
+// Pos returns tok.Pos(offset), but first checks that the offset is valid for
+// the given file.
+func Pos(tok *token.File, offset int) (token.Pos, error) {
+	if offset < 0 || offset > tok.Size() {
+		return token.NoPos, fmt.Errorf("offset %v is not in range for file of size %v", offset, tok.Size())
+	}
+	return tok.Pos(offset), nil
+}
+
+// InRange reports whether the given position is in the given token.File.
+func InRange(tok *token.File, pos token.Pos) bool {
+	size := tok.Pos(tok.Size())
+	return int(pos) >= tok.Base() && pos <= size
+}
+
+// LineToRange creates a Range spanning start and end.
+func LineToRange(m *protocol.ColumnMapper, uri span.URI, start, end modfile.Position) (protocol.Range, error) {
+	return ByteOffsetsToRange(m, uri, start.Byte, end.Byte)
+}
+
+// ByteOffsetsToRange creates a range spanning start and end.
+func ByteOffsetsToRange(m *protocol.ColumnMapper, uri span.URI, start, end int) (protocol.Range, error) {
+	line, col, err := m.Converter.ToPosition(start)
+	if err != nil {
+		return protocol.Range{}, err
+	}
+	s := span.NewPoint(line, col, start)
+	line, col, err = m.Converter.ToPosition(end)
+	if err != nil {
+		return protocol.Range{}, err
+	}
+	e := span.NewPoint(line, col, end)
+	return m.Range(span.New(uri, s, e))
 }

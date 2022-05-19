@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -33,8 +32,21 @@ func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitializ
 	s.state = serverInitializing
 	s.stateMu.Unlock()
 
-	s.clientPID = int(params.ProcessID)
-	s.progress.supportsWorkDoneProgress = params.Capabilities.Window.WorkDoneProgress
+	// For uniqueness, use the gopls PID rather than params.ProcessID (the client
+	// pid). Some clients might start multiple gopls servers, though they
+	// probably shouldn't.
+	pid := os.Getpid()
+	s.tempDir = filepath.Join(os.TempDir(), fmt.Sprintf("gopls-%d.%s", pid, s.session.ID()))
+	err := os.Mkdir(s.tempDir, 0700)
+	if err != nil {
+		// MkdirTemp could fail due to permissions issues. This is a problem with
+		// the user's environment, but should not block gopls otherwise behaving.
+		// All usage of s.tempDir should be predicated on having a non-empty
+		// s.tempDir.
+		event.Error(ctx, "creating temp dir", err)
+		s.tempDir = ""
+	}
+	s.progress.SetSupportsWorkDoneProgress(params.Capabilities.Window.WorkDoneProgress)
 
 	options := s.session.Options()
 	defer func() { s.session.SetOptions(options) }()
@@ -83,7 +95,24 @@ func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitializ
 		}
 	}
 
-	goplsVersion, err := json.Marshal(debug.VersionInfo())
+	versionInfo := debug.VersionInfo()
+
+	// golang/go#45732: Warn users who've installed sergi/go-diff@v1.2.0, since
+	// it will corrupt the formatting of their files.
+	for _, dep := range versionInfo.Deps {
+		if dep.Path == "github.com/sergi/go-diff" && dep.Version == "v1.2.0" {
+			if err := s.eventuallyShowMessage(ctx, &protocol.ShowMessageParams{
+				Message: `It looks like you have a bad gopls installation.
+Please reinstall gopls by running 'GO111MODULE=on go install golang.org/x/tools/gopls@latest'.
+See https://github.com/golang/go/issues/45732 for more information.`,
+				Type: protocol.Error,
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	goplsVersion, err := json.Marshal(versionInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -120,8 +149,8 @@ func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitializ
 					IncludeText: false,
 				},
 			},
-			Workspace: protocol.WorkspaceGn{
-				WorkspaceFolders: protocol.WorkspaceFoldersGn{
+			Workspace: protocol.Workspace6Gn{
+				WorkspaceFolders: protocol.WorkspaceFolders5Gn{
 					Supported:           true,
 					ChangeNotifications: "workspace/didChangeWorkspaceFolders",
 				},
@@ -159,20 +188,17 @@ func (s *Server) initialized(ctx context.Context, params *protocol.InitializedPa
 	}
 	s.pendingFolders = nil
 
+	var registrations []protocol.Registration
 	if options.ConfigurationSupported && options.DynamicConfigurationSupported {
-		registrations := []protocol.Registration{
-			{
-				ID:     "workspace/didChangeConfiguration",
-				Method: "workspace/didChangeConfiguration",
-			},
-			{
-				ID:     "workspace/didChangeWorkspaceFolders",
-				Method: "workspace/didChangeWorkspaceFolders",
-			},
-		}
-		if options.SemanticTokens {
-			registrations = append(registrations, semanticTokenRegistration())
-		}
+		registrations = append(registrations, protocol.Registration{
+			ID:     "workspace/didChangeConfiguration",
+			Method: "workspace/didChangeConfiguration",
+		})
+	}
+	if options.SemanticTokens && options.DynamicRegistrationSemanticTokensSupported {
+		registrations = append(registrations, semanticTokenRegistration(options.SemanticTypes, options.SemanticMods))
+	}
+	if len(registrations) > 0 {
 		if err := s.client.RegisterCapability(ctx, &protocol.RegistrationParams{
 			Registrations: registrations,
 		}); err != nil {
@@ -188,16 +214,15 @@ func (s *Server) addFolders(ctx context.Context, folders []protocol.WorkspaceFol
 
 	var wg sync.WaitGroup
 	if s.session.Options().VerboseWorkDoneProgress {
-		work := s.progress.start(ctx, DiagnosticWorkTitle(FromInitialWorkspaceLoad), "Calculating diagnostics for initial workspace load...", nil, nil)
+		work := s.progress.Start(ctx, DiagnosticWorkTitle(FromInitialWorkspaceLoad), "Calculating diagnostics for initial workspace load...", nil, nil)
 		defer func() {
 			go func() {
 				wg.Wait()
-				work.end("Done.")
+				work.End("Done.")
 			}()
 		}()
 	}
 	// Only one view gets to have a workspace.
-	assignedWorkspace := false
 	var allFoldersWg sync.WaitGroup
 	for _, folder := range folders {
 		uri := span.URIFromURI(folder.URI)
@@ -205,26 +230,14 @@ func (s *Server) addFolders(ctx context.Context, folders []protocol.WorkspaceFol
 		if !uri.IsFile() {
 			continue
 		}
-		work := s.progress.start(ctx, "Setting up workspace", "Loading packages...", nil, nil)
-		var workspaceURI span.URI = ""
-		if !assignedWorkspace && s.clientPID != 0 {
-			// For quick-and-dirty testing, set the temp workspace file to
-			// $TMPDIR/gopls-<client PID>.workspace.
-			//
-			// This has a couple limitations:
-			//  + If there are multiple workspace roots, only the first one gets
-			//    written to this dir (and the client has no way to know precisely
-			//    which one).
-			//  + If a single client PID spawns multiple gopls sessions, they will
-			//    clobber eachother's temp workspace.
-			wsdir := filepath.Join(os.TempDir(), fmt.Sprintf("gopls-%d.workspace", s.clientPID))
-			workspaceURI = span.URIFromPath(wsdir)
-			assignedWorkspace = true
+		work := s.progress.Start(ctx, "Setting up workspace", "Loading packages...", nil, nil)
+		snapshot, release, err := s.addView(ctx, folder.Name, uri)
+		if err == source.ErrViewExists {
+			continue
 		}
-		snapshot, release, err := s.addView(ctx, folder.Name, uri, workspaceURI)
 		if err != nil {
 			viewErrors[uri] = err
-			work.end(fmt.Sprintf("Error loading packages: %s", err))
+			work.End(fmt.Sprintf("Error loading packages: %s", err))
 			continue
 		}
 		var swg sync.WaitGroup
@@ -234,7 +247,7 @@ func (s *Server) addFolders(ctx context.Context, folders []protocol.WorkspaceFol
 			defer swg.Done()
 			defer allFoldersWg.Done()
 			snapshot.AwaitInitialized(ctx)
-			work.end("Finished loading packages.")
+			work.End("Finished loading packages.")
 		}()
 
 		// Print each view's environment.
@@ -341,7 +354,7 @@ func (s *Server) registerWatchedDirectoriesLocked(ctx context.Context, patterns 
 	for pattern := range patterns {
 		watchers = append(watchers, protocol.FileSystemWatcher{
 			GlobPattern: pattern,
-			Kind:        float64(protocol.WatchChange + protocol.WatchDelete + protocol.WatchCreate),
+			Kind:        uint32(protocol.WatchChange + protocol.WatchDelete + protocol.WatchCreate),
 		})
 	}
 
@@ -453,7 +466,8 @@ func (s *Server) beginFileRequest(ctx context.Context, pURI protocol.DocumentURI
 		release()
 		return nil, nil, false, func() {}, err
 	}
-	if expectKind != source.UnknownKind && fh.Kind() != expectKind {
+	kind := snapshot.View().FileKind(fh)
+	if expectKind != source.UnknownKind && kind != expectKind {
 		// Wrong kind of file. Nothing to do.
 		release()
 		return nil, nil, false, func() {}, nil
@@ -471,6 +485,11 @@ func (s *Server) shutdown(ctx context.Context) error {
 		// drop all the active views
 		s.session.Shutdown(ctx)
 		s.state = serverShutDown
+		if s.tempDir != "" {
+			if err := os.RemoveAll(s.tempDir); err != nil {
+				event.Error(ctx, "removing temp dir", err)
+			}
+		}
 	}
 	return nil
 }
@@ -479,8 +498,7 @@ func (s *Server) exit(ctx context.Context) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 
-	// TODO: We need a better way to find the conn close method.
-	s.client.(io.Closer).Close()
+	s.client.Close()
 
 	if s.state != serverShutDown {
 		// TODO: We should be able to do better than this.

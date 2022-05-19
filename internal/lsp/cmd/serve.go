@@ -11,7 +11,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"golang.org/x/tools/internal/fakenet"
@@ -42,19 +41,37 @@ type Serve struct {
 	app *Application
 }
 
-func (s *Serve) Name() string  { return "serve" }
-func (s *Serve) Usage() string { return "" }
+func (s *Serve) Name() string   { return "serve" }
+func (s *Serve) Parent() string { return s.app.Name() }
+func (s *Serve) Usage() string  { return "[server-flags]" }
 func (s *Serve) ShortHelp() string {
 	return "run a server for Go code using the Language Server Protocol"
 }
 func (s *Serve) DetailedHelp(f *flag.FlagSet) {
-	fmt.Fprint(f.Output(), `
+	fmt.Fprint(f.Output(), `  gopls [flags] [server-flags]
+
 The server communicates using JSONRPC2 on stdin and stdout, and is intended to be run directly as
 a child of an editor process.
 
-gopls server flags are:
+server-flags:
 `)
-	f.PrintDefaults()
+	printFlagDefaults(f)
+}
+
+func (s *Serve) remoteArgs(network, address string) []string {
+	args := []string{"serve",
+		"-listen", fmt.Sprintf(`%s;%s`, network, address),
+	}
+	if s.RemoteDebug != "" {
+		args = append(args, "-debug", s.RemoteDebug)
+	}
+	if s.RemoteListenTimeout != 0 {
+		args = append(args, "-listen.timeout", s.RemoteListenTimeout.String())
+	}
+	if s.RemoteLogfile != "" {
+		args = append(args, "-logfile", s.RemoteLogfile)
+	}
+	return args
 }
 
 // Run configures a server based on the flags, and then runs it.
@@ -73,25 +90,23 @@ func (s *Serve) Run(ctx context.Context, args ...string) error {
 		}
 		defer closeLog()
 		di.ServerAddress = s.Address
-		di.DebugAddress = s.Debug
-		di.Serve(ctx)
 		di.MonitorMemory(ctx)
+		di.Serve(ctx, s.Debug)
 	}
 	var ss jsonrpc2.StreamServer
 	if s.app.Remote != "" {
-		network, addr := parseAddr(s.app.Remote)
-		ss = lsprpc.NewForwarder(network, addr,
-			lsprpc.RemoteDebugAddress(s.RemoteDebug),
-			lsprpc.RemoteListenTimeout(s.RemoteListenTimeout),
-			lsprpc.RemoteLogfile(s.RemoteLogfile),
-		)
+		var err error
+		ss, err = lsprpc.NewForwarder(s.app.Remote, s.remoteArgs)
+		if err != nil {
+			return errors.Errorf("creating forwarder: %w", err)
+		}
 	} else {
-		ss = lsprpc.NewStreamServer(cache.New(ctx, s.app.options), isDaemon)
+		ss = lsprpc.NewStreamServer(cache.New(s.app.options), isDaemon)
 	}
 
 	var network, addr string
 	if s.Address != "" {
-		network, addr = parseAddr(s.Address)
+		network, addr = lsprpc.ParseAddr(s.Address)
 	}
 	if s.Port != 0 {
 		network = "tcp"
@@ -112,17 +127,4 @@ func (s *Serve) Run(ctx context.Context, args ...string) error {
 		return nil
 	}
 	return err
-}
-
-// parseAddr parses the -listen flag in to a network, and address.
-func parseAddr(listen string) (network string, address string) {
-	// Allow passing just -remote=auto, as a shorthand for using automatic remote
-	// resolution.
-	if listen == lsprpc.AutoNetwork {
-		return lsprpc.AutoNetwork, ""
-	}
-	if parts := strings.SplitN(listen, ";", 2); len(parts) == 2 {
-		return parts[0], parts[1]
-	}
-	return "tcp", listen
 }

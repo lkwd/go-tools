@@ -14,7 +14,6 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"runtime"
 	"unicode/utf8"
 
 	"golang.org/x/tools/internal/lsp"
@@ -53,24 +52,16 @@ type semtok struct {
 var colmap *protocol.ColumnMapper
 
 func (c *semtok) Name() string      { return "semtok" }
+func (c *semtok) Parent() string    { return c.app.Name() }
 func (c *semtok) Usage() string     { return "<filename>" }
 func (c *semtok) ShortHelp() string { return "show semantic tokens for the specified file" }
 func (c *semtok) DetailedHelp(f *flag.FlagSet) {
-	for i := 1; ; i++ {
-		_, f, l, ok := runtime.Caller(i)
-		if !ok {
-			break
-		}
-		log.Printf("%d: %s:%d", i, f, l)
-	}
 	fmt.Fprint(f.Output(), `
 Example: show the semantic tokens for this file:
 
-  $ gopls semtok internal/lsp/cmd/semtok.go
-
-	gopls semtok flags are:
+	$ gopls semtok internal/lsp/cmd/semtok.go
 `)
-	f.PrintDefaults()
+	printFlagDefaults(f)
 }
 
 // Run performs the semtok on the files specified by args and prints the
@@ -96,13 +87,24 @@ func (c *semtok) Run(ctx context.Context, args ...string) error {
 		return file.err
 	}
 
-	resp, err := conn.semanticTokens(ctx, uri)
+	buf, err := ioutil.ReadFile(args[0])
 	if err != nil {
 		return err
 	}
-	buf, err := ioutil.ReadFile(args[0])
+	lines := bytes.Split(buf, []byte{'\n'})
+	p := &protocol.SemanticTokensRangeParams{
+		TextDocument: protocol.TextDocumentIdentifier{
+			URI: protocol.URIFromSpanURI(uri),
+		},
+		Range: protocol.Range{Start: protocol.Position{Line: 0, Character: 0},
+			End: protocol.Position{
+				Line:      uint32(len(lines) - 1),
+				Character: uint32(len(lines[len(lines)-1]))},
+		},
+	}
+	resp, err := conn.semanticTokens(ctx, p)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, args[0], buf, 0)
@@ -164,7 +166,7 @@ func markLine(m mark, lines [][]byte) {
 	lines[m.line-1] = l
 }
 
-func decorate(file string, result []float64) error {
+func decorate(file string, result []uint32) error {
 	buf, err := ioutil.ReadFile(file)
 	if err != nil {
 		return err
@@ -182,14 +184,14 @@ func decorate(file string, result []float64) error {
 	return nil
 }
 
-func newMarks(d []float64) []mark {
+func newMarks(d []uint32) []mark {
 	ans := []mark{}
 	// the following two loops could be merged, at the cost
 	// of making the logic slightly more complicated to understand
 	// first, convert from deltas to absolute, in LSP coordinates
-	lspLine := make([]float64, len(d)/5)
-	lspChar := make([]float64, len(d)/5)
-	line, char := 0.0, 0.0
+	lspLine := make([]uint32, len(d)/5)
+	lspChar := make([]uint32, len(d)/5)
+	var line, char uint32
 	for i := 0; 5*i < len(d); i++ {
 		lspLine[i] = line + d[5*i+0]
 		if d[5*i+0] > 0 {

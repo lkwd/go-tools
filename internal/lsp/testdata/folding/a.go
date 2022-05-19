@@ -10,6 +10,7 @@ import _ "os"
 // bar is a function.
 // With a multiline doc comment.
 func bar() string {
+	/* This is a single line comment */
 	switch {
 	case true:
 		if true {
@@ -22,13 +23,21 @@ func bar() string {
 	default:
 		fmt.Println("default")
 	}
+	/* This is a multiline
+	block
+	comment */
+
+	/* This is a multiline
+	block
+	comment */
+	// Followed by another comment.
 	_ = []int{
 		1,
 		2,
 		3,
 	}
 	_ = [2]string{"d",
-		"e"
+		"e",
 	}
 	_ = map[string]int{
 		"a": 1,

@@ -119,10 +119,27 @@ of the second argument is not a pointer to a type implementing error.
 
 ## **fieldalignment**
 
-find structs that would take less memory if their fields were sorted
+find structs that would use less memory if their fields were sorted
 
-This analyzer find structs that can be rearranged to take less memory, and provides
+This analyzer find structs that can be rearranged to use less memory, and provides
 a suggested edit with the optimal order.
+
+Note that there are two different diagnostics reported. One checks struct size,
+and the other reports "pointer bytes" used. Pointer bytes is how many bytes of the
+object that the garbage collector has to potentially scan for pointers, for example:
+
+	struct { uint32; string }
+
+have 16 pointer bytes because the garbage collector has to scan up through the string's
+inner pointer.
+
+	struct { string; *uint32 }
+
+has 24 pointer bytes because it has to scan further through the *uint32.
+
+	struct { string; uint32 }
+
+has 8 because it can stop immediately after the string pointer.
 
 
 **Disabled by default. Enable it by setting `"analyses": {"fieldalignment": true}`.**
@@ -167,6 +184,22 @@ io.Reader, so this assertion cannot succeed.
 
 **Enabled by default.**
 
+## **infertypeargs**
+
+check for unnecessary type arguments in call expressions
+
+Explicit type arguments may be omitted from call expressions if they can be
+inferred from function arguments, or from other type arguments:
+
+	func f[T any](T) {}
+	
+	func _() {
+		f[string]("foo") // string could be inferred
+	}
+
+
+**Enabled by default.**
+
 ## **loopclosure**
 
 check references to loop variables from within nested functions
@@ -207,6 +240,46 @@ check for useless comparisons between functions and nil
 A useless comparison is one like f == nil as opposed to f() == nil.
 
 **Enabled by default.**
+
+## **nilness**
+
+check for redundant or impossible nil comparisons
+
+The nilness checker inspects the control-flow graph of each function in
+a package and reports nil pointer dereferences, degenerate nil
+pointers, and panics with nil values. A degenerate comparison is of the form
+x==nil or x!=nil where x is statically known to be nil or non-nil. These are
+often a mistake, especially in control flow related to errors. Panics with nil
+values are checked because they are not detectable by
+
+	if r := recover(); r != nil {
+
+This check reports conditions such as:
+
+	if f == nil { // impossible condition (f is a function)
+	}
+
+and:
+
+	p := &v
+	...
+	if p != nil { // tautological condition
+	}
+
+and:
+
+	if p == nil {
+		print(*p) // nil dereference
+	}
+
+and:
+
+	if p == nil {
+		panic(p)
+	}
+
+
+**Disabled by default. Enable it by setting `"analyses": {"nilness": true}`.**
 
 ## **printf**
 
@@ -468,9 +541,44 @@ The set of functions may be controlled using flags.
 
 **Enabled by default.**
 
+## **unusedwrite**
+
+checks for unused writes
+
+The analyzer reports instances of writes to struct fields and
+arrays that are never read. Specifically, when a struct object
+or an array is copied, its elements are copied implicitly by
+the compiler, and any element write to this copy does nothing
+with the original object.
+
+For example:
+
+	type T struct { x int }
+	func f(input []T) {
+		for i, v := range input {  // v is a copy
+			v.x = i  // unused write to field x
+		}
+	}
+
+Another example is about non-pointer receiver:
+
+	type T struct { x int }
+	func (t T) f() {  // t is a copy
+		t.x = i  // unused write to field x
+	}
+
+
+**Disabled by default. Enable it by setting `"analyses": {"unusedwrite": true}`.**
+
+## **useany**
+
+check for constraints that could be simplified to "any"
+
+**Disabled by default. Enable it by setting `"analyses": {"useany": true}`.**
+
 ## **fillreturns**
 
-suggested fixes for "wrong number of return values (want %d, got %d)"
+suggest fixes for errors due to an incorrect number of return values
 
 This checker provides suggested fixes for type errors of the
 type "wrong number of return values (want %d, got %d)". For example:
@@ -504,10 +612,11 @@ will turn into
 
 ## **noresultvalues**
 
-suggested fixes for "no result values expected"
+suggested fixes for unexpected return values
 
 This checker provides suggested fixes for type errors of the
-type "no result values expected". For example:
+type "no result values expected" or "too many return values".
+For example:
 	func z() { return nil }
 will turn into
 	func z() { return }
@@ -520,8 +629,17 @@ will turn into
 suggested fixes for "undeclared name: <>"
 
 This checker provides suggested fixes for type errors of the
-type "undeclared name: <>". It will insert a new statement:
-"<> := ".
+type "undeclared name: <>". It will either insert a new statement,
+such as:
+
+"<> := "
+
+or a new function declaration, such as:
+
+func <>(inferred parameters) {
+	panic("implement me!")
+}
+
 
 **Enabled by default.**
 
@@ -534,6 +652,15 @@ any fields initialized. Because the suggested fix for this analysis is
 expensive to compute, callers should compute it separately, using the
 SuggestedFix function below.
 
+
+**Enabled by default.**
+
+## **stubmethods**
+
+stub methods analyzer
+
+This analyzer generates method stubs for concrete types
+in order to implement a target interface
 
 **Enabled by default.**
 
