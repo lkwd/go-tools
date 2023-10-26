@@ -318,6 +318,7 @@ func (r *Renderer) renderHTMLBlock(w util.BufWriter, source []byte, node ast.Nod
 var ListAttributeFilter = GlobalAttributeFilter.Extend(
 	[]byte("start"),
 	[]byte("reversed"),
+	[]byte("type"),
 )
 
 func (r *Renderer) renderList(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
@@ -476,9 +477,7 @@ func (r *Renderer) renderCodeSpan(w util.BufWriter, source []byte, n ast.Node, e
 			value := segment.Value(source)
 			if bytes.HasSuffix(value, []byte("\n")) {
 				r.Writer.RawWrite(w, value[:len(value)-1])
-				if c != n.LastChild() {
-					r.Writer.RawWrite(w, []byte(" "))
-				}
+				r.Writer.RawWrite(w, []byte(" "))
 			} else {
 				r.Writer.RawWrite(w, value)
 			}
@@ -718,6 +717,12 @@ func (d *defaultWriter) Write(writer util.BufWriter, source []byte) {
 				continue
 			}
 		}
+		if c == '\x00' {
+			d.RawWrite(writer, source[n:i])
+			d.RawWrite(writer, []byte("\ufffd"))
+			n = i + 1
+			continue
+		}
 		if c == '&' {
 			pos := i
 			next := i + 1
@@ -729,7 +734,7 @@ func (d *defaultWriter) Write(writer util.BufWriter, source []byte) {
 					if nnext < limit && nc == 'x' || nc == 'X' {
 						start := nnext + 1
 						i, ok = util.ReadWhile(source, [2]int{start, limit}, util.IsHexDecimal)
-						if ok && i < limit && source[i] == ';' {
+						if ok && i < limit && source[i] == ';' && i-start < 7 {
 							v, _ := strconv.ParseUint(util.BytesToReadOnlyString(source[start:i]), 16, 32)
 							d.RawWrite(writer, source[n:pos])
 							n = i + 1
@@ -740,7 +745,7 @@ func (d *defaultWriter) Write(writer util.BufWriter, source []byte) {
 					} else if nc >= '0' && nc <= '9' {
 						start := nnext
 						i, ok = util.ReadWhile(source, [2]int{start, limit}, util.IsNumeric)
-						if ok && i < limit && i-start < 8 && source[i] == ';' {
+						if ok && i < limit && i-start < 8 && source[i] == ';' && i-start < 7 {
 							v, _ := strconv.ParseUint(util.BytesToReadOnlyString(source[start:i]), 0, 32)
 							d.RawWrite(writer, source[n:pos])
 							n = i + 1
