@@ -37,6 +37,12 @@ func (b *CopyOnWriteBuffer) Write(value []byte) {
 	b.buffer = append(b.buffer, value...)
 }
 
+// WriteString writes given string to the buffer.
+// WriteString allocate new buffer and clears it at the first time.
+func (b *CopyOnWriteBuffer) WriteString(value string) {
+	b.Write(StringToReadOnlyBytes(value))
+}
+
 // Append appends given bytes to the buffer.
 // Append copy buffer at the first time.
 func (b *CopyOnWriteBuffer) Append(value []byte) {
@@ -47,6 +53,12 @@ func (b *CopyOnWriteBuffer) Append(value []byte) {
 		b.copied = true
 	}
 	b.buffer = append(b.buffer, value...)
+}
+
+// AppendString appends given string to the buffer.
+// AppendString copy buffer at the first time.
+func (b *CopyOnWriteBuffer) AppendString(value string) {
+	b.Append(StringToReadOnlyBytes(value))
 }
 
 // WriteByte writes the given byte to the buffer.
@@ -118,6 +130,8 @@ func VisualizeSpaces(bs []byte) []byte {
 	bs = bytes.Replace(bs, []byte("\t"), []byte("[TAB]"), -1)
 	bs = bytes.Replace(bs, []byte("\n"), []byte("[NEWLINE]\n"), -1)
 	bs = bytes.Replace(bs, []byte("\r"), []byte("[CR]"), -1)
+	bs = bytes.Replace(bs, []byte("\x00"), []byte("[NUL]"), -1)
+	bs = bytes.Replace(bs, []byte("\ufffd"), []byte("[U+FFFD]"), -1)
 	return bs
 }
 
@@ -276,6 +290,10 @@ func FirstNonSpacePosition(bs []byte) int {
 // If codeSpan is set true, it ignores characters in code spans.
 // If allowNesting is set true, closures correspond to nested opener will be
 // ignored.
+//
+// Deprecated: This function can not handle newlines. Many elements
+// can be existed over multiple lines(e.g. link labels).
+// Use text.Reader.FindClosure.
 func FindClosure(bs []byte, opener, closure byte, codeSpan, allowNesting bool) int {
 	i := 0
 	opened := 1
@@ -695,7 +713,7 @@ func URLEscape(v []byte, resolveReference bool) []byte {
 			n = i
 			continue
 		}
-		if int(u8len) >= len(v) {
+		if int(u8len) > len(v) {
 			u8len = int8(len(v) - 1)
 		}
 		if u8len == 0 {
@@ -781,7 +799,7 @@ func FindEmailIndex(b []byte) int {
 
 var spaces = []byte(" \t\n\x0b\x0c\x0d")
 
-var spaceTable = [256]int8{0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+var spaceTable = [256]int8{0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 
 var punctTable = [256]int8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 
@@ -804,7 +822,7 @@ func IsPunct(c byte) bool {
 	return punctTable[c] == 1
 }
 
-// IsPunct returns true if the given rune is a punctuation, otherwise false.
+// IsPunctRune returns true if the given rune is a punctuation, otherwise false.
 func IsPunctRune(r rune) bool {
 	return int32(r) <= 256 && IsPunct(byte(r)) || unicode.IsPunct(r)
 }
@@ -814,7 +832,7 @@ func IsSpace(c byte) bool {
 	return spaceTable[c] == 1
 }
 
-// IsSpace returns true if the given rune is a space, otherwise false.
+// IsSpaceRune returns true if the given rune is a space, otherwise false.
 func IsSpaceRune(r rune) bool {
 	return int32(r) <= 256 && IsSpace(byte(r)) || unicode.IsSpace(r)
 }
